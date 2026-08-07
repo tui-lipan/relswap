@@ -12,6 +12,12 @@ use std::ops::Deref;
 /// The only manifest schema accepted by this build.
 pub const MANIFEST_SCHEMA_VERSION: u32 = 2;
 
+/// Host-clock tolerance applied by [`ReleaseManifest::ensure_not_expired`].
+///
+/// Large enough to absorb an unsynchronised clock, small enough to be irrelevant against the
+/// year-scale validity window a publisher is expected to sign.
+pub const EXPIRY_CLOCK_SKEW: chrono::TimeDelta = chrono::TimeDelta::hours(12);
+
 /// Metadata for the exact executable member selected from an archive.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -341,13 +347,22 @@ impl ReleaseManifest {
         Ok(())
     }
 
+    /// Reject a manifest whose validity window has closed.
+    ///
+    /// This is the freeze-attack defence: a signature stays valid forever, so without an expiry an
+    /// attacker who can withhold responses could pin a client to a stale-but-authentic manifest.
+    ///
+    /// `now` comes from the host clock, which is not always right - a fresh VM before its first NTP
+    /// sync can be hours or days off. [`EXPIRY_CLOCK_SKEW`] is subtracted so a modest skew degrades
+    /// into a late expiry rather than a machine that cannot update at all. It is deliberately small
+    /// relative to the year-scale validity window a publisher is expected to use.
     pub fn ensure_not_expired(&self, now: DateTime<Utc>) -> Result<()> {
         let expires_at = DateTime::parse_from_rfc3339(&self.expires_at)
             .map_err(|error| {
                 ReleaseError::invalid(format!("invalid expires_at RFC3339 timestamp: {error}"))
             })?
             .with_timezone(&Utc);
-        if now > expires_at {
+        if now - EXPIRY_CLOCK_SKEW > expires_at {
             return Err(ReleaseError::invalid("release manifest has expired"));
         }
         Ok(())
@@ -587,13 +602,28 @@ mod tests {
         assert!(
             ReleaseManifest::from_bytes(&TEST_APP, &serde_json::to_vec(&value).unwrap()).is_err()
         );
+        let at = |text: &str| {
+            DateTime::parse_from_rfc3339(text)
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+        // Inside the window.
         assert!(
             manifest
-                .ensure_not_expired(
-                    DateTime::parse_from_rfc3339("2027-08-02T12:00:01Z")
-                        .unwrap()
-                        .with_timezone(&Utc)
-                )
+                .ensure_not_expired(at("2027-08-02T11:59:59Z"))
+                .is_ok()
+        );
+        // Past `expires_at` but inside EXPIRY_CLOCK_SKEW: an unsynchronised host clock must not
+        // make a current release uninstallable.
+        assert!(
+            manifest
+                .ensure_not_expired(at("2027-08-02T23:59:59Z"))
+                .is_ok()
+        );
+        // Past `expires_at` by more than the tolerance.
+        assert!(
+            manifest
+                .ensure_not_expired(at("2027-08-03T00:00:01Z"))
                 .is_err()
         );
     }
