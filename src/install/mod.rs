@@ -1170,8 +1170,18 @@ mod tests {
         assert!(!manager.pending_path().exists());
         assert!(manager.version_dir(&version).join(MANIFEST_FILE).is_file());
         assert!(manager.version_dir(&version).join(VERSION_FILE).is_file());
-        let target = fs::read_link(&command).unwrap();
-        assert!(target.is_absolute());
+        // Activation is per-platform: Unix repoints an absolute symlink at the payload, Windows
+        // rewrites the selector file the launcher reads.  Assert whichever this host actually uses.
+        #[cfg(unix)]
+        {
+            let target = fs::read_link(&command).unwrap();
+            assert!(target.is_absolute());
+        }
+        #[cfg(windows)]
+        {
+            let active = fs::read_to_string(manager.active_path()).unwrap();
+            assert_eq!(active.trim(), version.to_string());
+        }
         let _ = fs::remove_dir_all(&root);
     }
 
