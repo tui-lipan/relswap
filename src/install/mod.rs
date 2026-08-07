@@ -817,10 +817,8 @@ mod tests {
     // Keep the fixture helpers local to this file: the production path always uses the caller's
     // trust anchor, while these tests inject a deterministic key set through the explicit
     // verifier seam.
-    #[allow(dead_code)]
-    fn signed_fixture(version: &Version) -> (ReleaseMetadata, TrustedKey, Vec<u8>) {
-        let target = Target::current().unwrap();
-        let payload = b"fixture payload";
+    /// A `.tar.gz` in the canonical Unix shape: a root directory and one payload member.
+    fn unix_fixture_archive(target: Target, version: &Version, payload: &[u8]) -> Vec<u8> {
         let mut compressed = GzEncoder::new(Vec::new(), Compression::default());
         {
             let mut builder = tar::Builder::new(&mut compressed);
@@ -845,12 +843,65 @@ mod tests {
                 .append_data(
                     &mut header,
                     target.payload_path(&TEST_APP, version),
-                    Cursor::new(payload.as_slice()),
+                    Cursor::new(payload),
                 )
                 .unwrap();
             builder.finish().unwrap();
         }
-        let archive = compressed.finish().unwrap();
+        compressed.finish().unwrap()
+    }
+
+    /// A `.zip` in the canonical Windows shape: a root directory, the payload, and the launcher a
+    /// Windows asset is required to carry.
+    fn windows_fixture_archive(
+        target: Target,
+        version: &Version,
+        payload: &[u8],
+        launcher: &[u8],
+    ) -> Vec<u8> {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        use zip::{CompressionMethod, ZipWriter};
+
+        let mut output = Cursor::new(Vec::new());
+        {
+            let mut writer = ZipWriter::new(&mut output);
+            let options =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            writer
+                .add_directory(
+                    format!("{}/", target.root_name(&TEST_APP, version)),
+                    options,
+                )
+                .unwrap();
+            writer
+                .start_file(target.payload_path(&TEST_APP, version), options)
+                .unwrap();
+            writer.write_all(payload).unwrap();
+            writer
+                .start_file(target.launcher_path(&TEST_APP, version).unwrap(), options)
+                .unwrap();
+            writer.write_all(launcher).unwrap();
+            writer.finish().unwrap();
+        }
+        output.into_inner()
+    }
+
+    /// A signed single-target release for the host platform.
+    ///
+    /// The archive format and member set are per-target: a Windows asset is a zip that must carry a
+    /// protocol-1 launcher beside the payload, and validation rejects one that does not. Building
+    /// only the Unix shape would leave the Windows install path with no passing coverage at all.
+    #[allow(dead_code)]
+    fn signed_fixture(version: &Version) -> (ReleaseMetadata, TrustedKey, Vec<u8>) {
+        let target = Target::current().unwrap();
+        let payload = b"fixture payload";
+        let launcher = b"fixture launcher";
+        let archive = if target.is_windows() {
+            windows_fixture_archive(target, version, payload, launcher)
+        } else {
+            unix_fixture_archive(target, version, payload)
+        };
         let asset = ReleaseAsset::new(
             &TEST_APP,
             version,
@@ -860,6 +911,18 @@ mod tests {
             payload.len() as u64,
             release::sha256_bytes(payload),
         );
+        let asset = if target.is_windows() {
+            asset.with_launcher(
+                &TEST_APP,
+                version,
+                target,
+                TEST_APP.launcher_protocol().unwrap(),
+                launcher.len() as u64,
+                release::sha256_bytes(launcher),
+            )
+        } else {
+            asset
+        };
         let manifest = ReleaseManifest::new(
             &TEST_APP,
             version.clone(),
