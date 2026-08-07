@@ -627,6 +627,28 @@ fn verify_file_digest(
     Ok(())
 }
 
+/// Flush one staged file's contents to disk.
+///
+/// `sync_all` is `fsync` on Unix, which is happy with a read-only descriptor, but it is
+/// `FlushFileBuffers` on Windows, which requires a handle carrying write access and fails with
+/// `ERROR_ACCESS_DENIED` otherwise.  The staged payload is ours and still writable at this point in
+/// the pipeline, so asking for write access is free; the Unix open stays read-only so the durability
+/// behaviour there is unchanged.
+fn sync_file(path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?
+            .sync_all()
+    }
+    #[cfg(not(windows))]
+    {
+        File::open(path)?.sync_all()
+    }
+}
+
 fn sync_regular_files(dir: &Path) -> Result<()> {
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
@@ -641,7 +663,7 @@ fn sync_regular_files(dir: &Path) -> Result<()> {
             sync_regular_files(&path)?;
             executable::sync_dir(&path)?;
         } else if metadata.is_file() {
-            File::open(&path)?.sync_all()?;
+            sync_file(&path)?;
         } else {
             return Err(InstallError::Invalid(format!(
                 "staging contains a special file: {}",
@@ -1201,6 +1223,10 @@ mod tests {
         let source = staging.join("version");
         fs_security::ensure_private_dir(&source).expect("stage: private version dir");
         fs::write(source.join("hyprmux.exe"), b"payload").expect("stage: write payload");
+
+        // Regressed once: sync_all is FlushFileBuffers here and needs a writable handle, so a
+        // read-only open fails the whole install with a bare ERROR_ACCESS_DENIED.
+        sync_regular_files(&source).expect("stage: sync_regular_files");
 
         executable::rename_new(&source, &manager.version_dir(&version))
             .expect("stage: rename_new version directory");
