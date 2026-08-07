@@ -139,8 +139,7 @@ Commands:\n\
   sign --name APP [--launcher-name FILE] --manifest PATH --output PATH --key-id ID\n\
        [--private-key PATH] [--append]\n\
       Sign the exact manifest bytes. The private key is base64 in PATH, or in\n\
-      RELSWAP_RELEASE_PRIVATE_KEY when PATH is omitted. HYPRMUX_RELEASE_PRIVATE_KEY remains\n\
-      accepted as a transitional fallback.\n\
+      RELSWAP_RELEASE_PRIVATE_KEY when PATH is omitted.\n\
   verify --name APP [--launcher-name FILE] --manifest PATH --signatures PATH --keys PATH\n\
          --artifacts-dir DIR\n\
       Verify the rotation envelope, trusted public key, archive layout, payload hashes, sizes,\n\
@@ -793,7 +792,6 @@ fn load_private_key(args: &Arguments) -> Result<SigningKey> {
         String::from_utf8(bytes).map_err(|_| "private key is not UTF-8 base64".to_string())?
     } else {
         env::var("RELSWAP_RELEASE_PRIVATE_KEY")
-            .or_else(|_| env::var("HYPRMUX_RELEASE_PRIVATE_KEY"))
             .map_err(|_| "--private-key or RELSWAP_RELEASE_PRIVATE_KEY is required".to_string())?
     };
     let encoded = encoded.trim();
