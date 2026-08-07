@@ -1234,16 +1234,34 @@ mod tests {
         )
     }
 
+    /// Write a staged payload that reports `reports` the way a real binary reports `--version`.
+    ///
+    /// `reports` is deliberately independent of the directory the payload is staged in, so a test
+    /// can stage a correct version whose binary lies about which release it is.
     #[cfg(unix)]
-    fn write_self_test_payload(manager: &Installation<FixtureDownloader>, version: &Version) {
+    fn write_self_test_payload(
+        manager: &Installation<FixtureDownloader>,
+        version: &Version,
+        reports: &str,
+    ) {
         use std::os::unix::fs::PermissionsExt;
 
         let payload = manager.payload_path(version);
         fs::create_dir_all(payload.parent().unwrap()).unwrap();
         fs::create_dir_all(manager.command_path().parent().unwrap()).unwrap();
-        fs::write(&payload, b"#!/bin/sh\nprintf '%s\\n' \"$1\"\n").unwrap();
+        fs::write(
+            &payload,
+            format!("#!/bin/sh\nprintf 'hyprmux {reports}\\n'\n"),
+        )
+        .unwrap();
         fs::set_permissions(&payload, fs::Permissions::from_mode(0o755)).unwrap();
     }
+
+    #[cfg(unix)]
+    const SELF_TEST: Option<crate::SelfTest> = Some(crate::SelfTest {
+        args: &["--version"],
+        timeout: std::time::Duration::from_secs(5),
+    });
 
     #[cfg(unix)]
     #[test]
@@ -1254,30 +1272,17 @@ mod tests {
             repository_url: "https://example.test/",
             trust_anchor: br#"{"schema_version":1,"keys":[]}"#,
             activation: ActivationStrategy::UnixSymlink,
-            self_test: Some(crate::SelfTest {
-                args: &["expected"],
-                expect_contains: "expected",
-                timeout: std::time::Duration::from_secs(1),
-            }),
+            self_test: SELF_TEST,
         };
         let version = Version::parse("1.2.3").unwrap();
         let root =
             std::env::temp_dir().join(format!("relswap-self-test-ok-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let manager = self_test_manager(&APP, &root);
-        write_self_test_payload(&manager, &version);
-        assert!(
-            manager
-                .activate_pointer_and_state(
-                    None,
-                    version.clone(),
-                    "a".repeat(64),
-                    None,
-                    None,
-                    None,
-                )
-                .is_ok()
-        );
+        write_self_test_payload(&manager, &version, "1.2.3");
+        manager
+            .activate_pointer_and_state(None, version.clone(), "a".repeat(64), None, None, None)
+            .expect("activation");
         assert_eq!(manager.read_pointer_unlocked().unwrap(), Some(version));
         let _ = fs::remove_dir_all(root);
     }
@@ -1291,20 +1296,86 @@ mod tests {
             repository_url: "https://example.test/",
             trust_anchor: br#"{"schema_version":1,"keys":[]}"#,
             activation: ActivationStrategy::UnixSymlink,
-            self_test: Some(crate::SelfTest {
-                args: &["actual"],
-                expect_contains: "expected",
-                timeout: std::time::Duration::from_secs(1),
-            }),
+            self_test: SELF_TEST,
         };
         let version = Version::parse("1.2.3").unwrap();
         let root =
             std::env::temp_dir().join(format!("relswap-self-test-mismatch-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let manager = self_test_manager(&APP, &root);
-        write_self_test_payload(&manager, &version);
+        write_self_test_payload(&manager, &version, "9.9.9");
         let error = manager
             .activate_pointer_and_state(None, version, "a".repeat(64), None, None, None)
+            .unwrap_err();
+        assert!(error.to_string().contains("output mismatch"));
+        assert!(!manager.command_path().exists());
+        assert!(!manager.pending_path().exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The update case: the staged payload is a different release than the running binary.
+    ///
+    /// A probe expectation taken from `App::version` would reject every update while still letting
+    /// a first install pass, so this activates a version deliberately unequal to `App::version`.
+    #[cfg(unix)]
+    #[test]
+    fn self_test_expects_the_activated_version_not_the_running_binary() {
+        static APP: App = App {
+            name: "hyprmux",
+            version: "1.2.3",
+            repository_url: "https://example.test/",
+            trust_anchor: br#"{"schema_version":1,"keys":[]}"#,
+            activation: ActivationStrategy::UnixSymlink,
+            self_test: SELF_TEST,
+        };
+        let version = Version::parse("2.0.0").unwrap();
+        let root =
+            std::env::temp_dir().join(format!("relswap-self-test-update-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let manager = self_test_manager(&APP, &root);
+        write_self_test_payload(&manager, &version, "2.0.0");
+        manager
+            .activate_pointer_and_state(
+                Some(Version::parse("1.2.3").unwrap()),
+                version.clone(),
+                "a".repeat(64),
+                None,
+                None,
+                None,
+            )
+            .expect("activation");
+        assert_eq!(manager.read_pointer_unlocked().unwrap(), Some(version));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The inverse guard: a staged payload reporting the *running* version must be rejected, so the
+    /// expectation can never quietly drift back to `App::version`.
+    #[cfg(unix)]
+    #[test]
+    fn self_test_rejects_a_payload_reporting_the_running_binary_version() {
+        static APP: App = App {
+            name: "hyprmux",
+            version: "1.2.3",
+            repository_url: "https://example.test/",
+            trust_anchor: br#"{"schema_version":1,"keys":[]}"#,
+            activation: ActivationStrategy::UnixSymlink,
+            self_test: SELF_TEST,
+        };
+        let version = Version::parse("2.0.0").unwrap();
+        let root =
+            std::env::temp_dir().join(format!("relswap-self-test-stale-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let manager = self_test_manager(&APP, &root);
+        write_self_test_payload(&manager, &version, "1.2.3");
+        let error = manager
+            .activate_pointer_and_state(
+                Some(Version::parse("1.2.3").unwrap()),
+                version,
+                "a".repeat(64),
+                None,
+                None,
+                None,
+            )
             .unwrap_err();
         assert!(error.to_string().contains("output mismatch"));
         assert!(!manager.command_path().exists());

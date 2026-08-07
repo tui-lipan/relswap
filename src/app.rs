@@ -38,14 +38,17 @@ pub enum ActivationStrategy {
 /// Probe the staged payload before activation.
 ///
 /// Runs `versions/<v>/<payload> <args…>` under a timeout and requires combined stdout/stderr to
-/// contain [`SelfTest::expect_contains`]. Catchs correctly signed binaries that cannot run on the
-/// host (for example a glibc mismatch).
+/// contain the canonical string of the version being activated. Catches correctly signed binaries
+/// that cannot run on the host (for example a glibc mismatch) and binaries that do not report the
+/// version the manifest claims they are.
+///
+/// The expected substring is always derived from the version under activation, never from
+/// [`App::version`]: during an update the staged payload is a *different* version than the running
+/// binary, so a caller-supplied constant could only ever match a first install.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SelfTest {
     /// Arguments passed to the staged payload (for example `&["--version"]`).
     pub args: &'static [&'static str],
-    /// Required substring of combined stdout and stderr (typically the expected version).
-    pub expect_contains: &'static str,
     /// Wall-clock timeout for the probe process.
     pub timeout: std::time::Duration,
 }

@@ -6,7 +6,10 @@ use crate::release::{ReleaseMetadata, ReleaseTarget};
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Backoff between self-test spawn attempts rejected with `ETXTBSY`.
+const SELF_TEST_BUSY_RETRY_DELAY: Duration = Duration::from_millis(25);
 
 impl<D: Downloader> Installation<D> {
     /// Install the exact package version supplied by [`App::version`].
@@ -428,13 +431,42 @@ impl<D: Downloader> Installation<D> {
         })
     }
 
+    /// Run the configured probe against the staged payload for `version`.
+    ///
+    /// The expected output is derived from `version` - the release about to be activated - so the
+    /// check is correct for updates, where the staged payload differs from the running binary.
     fn run_self_test(&self, version: &Version, config: crate::SelfTest) -> Result<()> {
-        let mut child = Command::new(self.payload_path(version))
-            .args(config.args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|_| InstallError::Invalid("self-test failed".into()))?;
+        let started = Instant::now();
+        // ETXTBSY is a race, not a verdict on the payload.  A `fork` in any thread of the host
+        // process briefly inherits every open descriptor, so a payload we have only just finished
+        // writing can be reported busy because an unrelated thread spawned a child in that window -
+        // routine in a threaded application, which is exactly what this crate is embedded in.
+        // Retry within the caller's timeout budget.
+        //
+        // Every other spawn failure is reported with its cause: the probe exists to diagnose a
+        // payload that cannot run, and a bare "self-test failed" would hide precisely the
+        // ENOENT/EACCES/loader errors it was added to surface.
+        let mut child = loop {
+            match Command::new(self.payload_path(version))
+                .args(config.args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+            {
+                Ok(child) => break child,
+                Err(error)
+                    if error.kind() == io::ErrorKind::ExecutableFileBusy
+                        && started.elapsed() + SELF_TEST_BUSY_RETRY_DELAY < config.timeout =>
+                {
+                    thread::sleep(SELF_TEST_BUSY_RETRY_DELAY);
+                }
+                Err(error) => {
+                    return Err(InstallError::Invalid(format!(
+                        "self-test could not run staged payload: {error}"
+                    )));
+                }
+            }
+        };
         let mut stdout = child
             .stdout
             .take()
@@ -451,7 +483,9 @@ impl<D: Downloader> Installation<D> {
             let mut bytes = Vec::new();
             stderr.read_to_end(&mut bytes).map(|_| bytes)
         });
-        let started = Instant::now();
+        // `started` is deliberately not reset: `config.timeout` bounds the whole probe, spawn
+        // retries included, so a payload that is busy for the full budget cannot also get a fresh
+        // budget to run in.
         let status = loop {
             if let Some(status) = child
                 .try_wait()
@@ -481,7 +515,7 @@ impl<D: Downloader> Installation<D> {
         if !status.success() {
             return Err(InstallError::Invalid("self-test failed".into()));
         }
-        if !String::from_utf8_lossy(&output).contains(config.expect_contains) {
+        if !String::from_utf8_lossy(&output).contains(&version.to_string()) {
             return Err(InstallError::Invalid("self-test output mismatch".into()));
         }
         Ok(())
