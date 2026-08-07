@@ -341,7 +341,13 @@ fn ensure_new_path(path: &Path, label: &str) -> Result<()> {
 }
 
 fn ensure_parent(path: &Path) -> Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    // A bare filename yields `Some("")` rather than `None`, so the fallback has to cover the empty
+    // path too: `Path::new("").is_dir()` is false, which otherwise rejects `--public-key keys.json`
+    // - the most natural way to invoke this - with a message naming no directory at all.
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
     if !parent.is_dir() {
         return Err(format!(
             "parent directory {} does not exist",
