@@ -1167,6 +1167,49 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// Name which Windows filesystem primitive fails, rather than surfacing a bare "Access is
+    /// denied" from somewhere inside a whole install.
+    ///
+    /// `InstallError::Io` carries no path, so a failure in the install pipeline is
+    /// indistinguishable between the private-directory DACL, the no-replace directory rename, and
+    /// the selector write. Each stage here is asserted separately and in pipeline order.
+    #[cfg(windows)]
+    #[test]
+    fn windows_layout_rename_and_selector_primitives_work() {
+        let version = Version::parse("1.2.3").unwrap();
+        let root =
+            std::env::temp_dir().join(format!("relswap-win-primitives-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let command = root.join("bin").join("hyprmux.exe");
+        let manager = Installation::new(
+            &TEST_APP,
+            &root,
+            &command,
+            FixtureDownloader::default(),
+            NoFaultInjector,
+        );
+
+        manager
+            .ensure_private_layout()
+            .expect("stage: ensure_private_layout");
+        manager
+            .ensure_command_parent()
+            .expect("stage: ensure_command_parent");
+
+        let staging = manager.staging_dir().join("transaction");
+        fs_security::ensure_private_dir(&staging).expect("stage: private staging dir");
+        let source = staging.join("version");
+        fs_security::ensure_private_dir(&source).expect("stage: private version dir");
+        fs::write(source.join("hyprmux.exe"), b"payload").expect("stage: write payload");
+
+        executable::rename_new(&source, &manager.version_dir(&version))
+            .expect("stage: rename_new version directory");
+        executable::atomic_replace_file(&manager.active_path(), version.to_string().as_bytes())
+            .expect("stage: atomic_replace_file selector");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[cfg(unix)]
     #[test]
     fn every_activation_boundary_recovers_to_a_valid_install() {
