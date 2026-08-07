@@ -9,6 +9,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # Platform failures here are usually a path several frames below the assertion, and the runner is
+  # the only place some of them can be reproduced at all.
+  RUST_BACKTRACE: 1
 
 permissions:
   contents: read
