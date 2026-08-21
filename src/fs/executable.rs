@@ -1591,9 +1591,15 @@ fn replace_existing(source: &Path, destination: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    fn test_temp_dir() -> PathBuf {
+        std::env::temp_dir()
+            .canonicalize()
+            .expect("canonical temporary directory")
+    }
+
     #[test]
     fn atomic_replacement_is_durable_and_replaces_only_regular_files() {
-        let root = std::env::temp_dir().join(format!(
+        let root = test_temp_dir().join(format!(
             "hyprmux-executable-test-{}-{}",
             std::process::id(),
             TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -1609,7 +1615,7 @@ mod tests {
 
     #[test]
     fn create_new_file_never_replaces_an_existing_path() {
-        let root = std::env::temp_dir().join(format!(
+        let root = test_temp_dir().join(format!(
             "hyprmux-executable-create-new-test-{}-{}",
             std::process::id(),
             TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -1628,7 +1634,7 @@ mod tests {
 
     #[test]
     fn rename_new_never_replaces_an_existing_destination() {
-        let root = std::env::temp_dir().join(format!(
+        let root = test_temp_dir().join(format!(
             "relswap-executable-rename-new-test-{}-{}",
             std::process::id(),
             TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -1663,7 +1669,7 @@ mod tests {
     fn handle_relative_create_rejects_symlink_ancestors_and_outputs() {
         use std::os::unix::fs::symlink;
 
-        let root = std::env::temp_dir().join(format!(
+        let root = test_temp_dir().join(format!(
             "relswap-executable-openat-test-{}-{}",
             std::process::id(),
             TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -1690,7 +1696,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn retained_directory_detects_path_replacement_and_cleans_original() {
-        let root = std::env::temp_dir().join(format!(
+        let root = test_temp_dir().join(format!(
             "relswap-directory-identity-test-{}-{}",
             std::process::id(),
             TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -1773,7 +1779,7 @@ mod tests {
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
 
-        let path = std::env::temp_dir().join(format!(
+        let path = test_temp_dir().join(format!(
             "relswap-executable-fifo-test-{}-{}",
             std::process::id(),
             TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -1790,7 +1796,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn symlink_switch_is_absolute_and_atomic() {
-        let root = std::env::temp_dir().join(format!(
+        let root = test_temp_dir().join(format!(
             "hyprmux-executable-link-test-{}-{}",
             std::process::id(),
             TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)

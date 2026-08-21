@@ -1030,6 +1030,12 @@ mod tests {
     use tar::Builder;
     use zip::write::{SimpleFileOptions, ZipWriter};
 
+    fn test_temp_dir() -> PathBuf {
+        std::env::temp_dir()
+            .canonicalize()
+            .expect("canonical temporary directory")
+    }
+
     const ARCHIVE_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const PAYLOAD_HASH: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
@@ -1456,7 +1462,7 @@ mod tests {
         let archive = tar_archive(&version, &format!("{root_name}/hyprmux"), b"bin");
         let asset = unix_asset(&version, &archive);
         let destination =
-            std::env::temp_dir().join(format!("relswap-extract-existing-{}", std::process::id()));
+            test_temp_dir().join(format!("relswap-extract-existing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&destination);
         std::fs::create_dir_all(&destination).unwrap();
         std::fs::write(destination.join("hyprmux"), b"original").unwrap();
@@ -1486,7 +1492,7 @@ mod tests {
         )
         .with_launcher(&TEST_APP, &version, target, 1, 3, sha256_bytes(b"run"));
         let destination =
-            std::env::temp_dir().join(format!("relswap-extract-rollback-{}", std::process::id()));
+            test_temp_dir().join(format!("relswap-extract-rollback-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&destination);
         std::fs::create_dir_all(&destination).unwrap();
         std::fs::write(destination.join("hyprmux-launcher.exe"), b"original").unwrap();
@@ -1509,8 +1515,7 @@ mod tests {
         let root_name = Target::X86_64UnknownLinuxGnu.root_name(&TEST_APP, &version);
         let archive = tar_archive(&version, &format!("{root_name}/hyprmux"), b"bin");
         let asset = unix_asset(&version, &archive);
-        let root =
-            std::env::temp_dir().join(format!("relswap-extract-symlink-{}", std::process::id()));
+        let root = test_temp_dir().join(format!("relswap-extract-symlink-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("real")).unwrap();
         std::fs::create_dir_all(root.join("outside")).unwrap();

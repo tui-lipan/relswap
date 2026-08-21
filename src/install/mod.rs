@@ -957,6 +957,12 @@ mod tests {
     use std::io::Cursor;
     use std::sync::Mutex;
 
+    fn test_temp_dir() -> PathBuf {
+        std::env::temp_dir()
+            .canonicalize()
+            .expect("canonical temporary directory")
+    }
+
     static TEST_APP: App = App {
         name: "hyprmux",
         version: "1.2.3",
@@ -1375,7 +1381,7 @@ mod tests {
                 ),
             ),
         ]);
-        let root = std::env::temp_dir().join(format!(
+        let root = test_temp_dir().join(format!(
             "relswap-install-test-{}-{}",
             std::process::id(),
             version
@@ -1417,7 +1423,7 @@ mod tests {
     #[test]
     fn an_existing_version_is_reused_only_while_fully_verified() {
         let version = Version::parse("1.2.3").unwrap();
-        let root = std::env::temp_dir().join(format!("relswap-reuse-test-{}", std::process::id()));
+        let root = test_temp_dir().join(format!("relswap-reuse-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let manager = fixture_manager(&version, &root, NoFaultInjector);
         assert!(manager.install_version(version.clone()).unwrap().changed);
@@ -1437,8 +1443,7 @@ mod tests {
     #[test]
     fn windows_layout_rename_and_selector_primitives_work() {
         let version = Version::parse("1.2.3").unwrap();
-        let root =
-            std::env::temp_dir().join(format!("relswap-win-primitives-{}", std::process::id()));
+        let root = test_temp_dir().join(format!("relswap-win-primitives-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let command = root.join("bin").join("hyprmux-launcher.exe");
         let manager = Installation::new(
@@ -1477,8 +1482,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn invalid_windows_launcher_path_is_rejected_before_root_creation() {
-        let root =
-            std::env::temp_dir().join(format!("relswap-invalid-win-path-{}", std::process::id()));
+        let root = test_temp_dir().join(format!("relswap-invalid-win-path-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let manager = Installation::new(
             &TEST_APP,
@@ -1511,7 +1515,7 @@ mod tests {
             FaultPoint::ParentsSynced,
         ];
         for point in points {
-            let root = std::env::temp_dir().join(format!(
+            let root = test_temp_dir().join(format!(
                 "relswap-fault-test-{}-{point:?}",
                 std::process::id()
             ));
@@ -1546,7 +1550,7 @@ mod tests {
     #[test]
     fn valid_pointer_repairs_disagreeing_descriptive_metadata_without_switching_it() {
         let version = Version::parse("1.2.3").unwrap();
-        let root = std::env::temp_dir().join(format!("relswap-repair-test-{}", std::process::id()));
+        let root = test_temp_dir().join(format!("relswap-repair-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let manager = fixture_manager(&version, &root, NoFaultInjector);
         manager.install_version(version.clone()).unwrap();
@@ -1574,10 +1578,9 @@ mod tests {
     #[test]
     fn initial_install_refuses_an_existing_unmanaged_command_without_creating_root_state() {
         let version = Version::parse("1.2.3").unwrap();
-        let root =
-            std::env::temp_dir().join(format!("relswap-ownership-root-{}", std::process::id()));
+        let root = test_temp_dir().join(format!("relswap-ownership-root-{}", std::process::id()));
         let command =
-            std::env::temp_dir().join(format!("relswap-ownership-command-{}", std::process::id()));
+            test_temp_dir().join(format!("relswap-ownership-command-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_file(&command);
         fs::write(&command, b"user executable").unwrap();
@@ -1594,8 +1597,7 @@ mod tests {
     fn rollback_revalidates_the_retained_target_before_switching_pointer() {
         let first = Version::parse("1.2.3").unwrap();
         let second = Version::parse("1.3.0").unwrap();
-        let root =
-            std::env::temp_dir().join(format!("relswap-rollback-test-{}", std::process::id()));
+        let root = test_temp_dir().join(format!("relswap-rollback-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let first_manager = fixture_manager(&first, &root, NoFaultInjector);
         first_manager.install_version(first.clone()).unwrap();
@@ -1678,8 +1680,7 @@ mod tests {
             self_test: SELF_TEST,
         };
         let version = Version::parse("1.2.3").unwrap();
-        let root =
-            std::env::temp_dir().join(format!("relswap-self-test-ok-{}", std::process::id()));
+        let root = test_temp_dir().join(format!("relswap-self-test-ok-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let manager = self_test_manager(&APP, &root);
         write_self_test_payload(&manager, &version, "1.2.3");
@@ -1703,7 +1704,7 @@ mod tests {
         };
         let version = Version::parse("1.2.3").unwrap();
         let root =
-            std::env::temp_dir().join(format!("relswap-self-test-mismatch-{}", std::process::id()));
+            test_temp_dir().join(format!("relswap-self-test-mismatch-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let manager = self_test_manager(&APP, &root);
         write_self_test_payload(&manager, &version, "9.9.9");
@@ -1728,8 +1729,7 @@ mod tests {
             self_test: SELF_TEST,
         };
         let version = Version::parse("1.2.3").unwrap();
-        let root =
-            std::env::temp_dir().join(format!("relswap-self-test-output-{}", std::process::id()));
+        let root = test_temp_dir().join(format!("relswap-self-test-output-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let manager = self_test_manager(&APP, &root);
         write_self_test_script(
@@ -1763,7 +1763,7 @@ mod tests {
         };
         let version = Version::parse("1.2.3").unwrap();
         let root =
-            std::env::temp_dir().join(format!("relswap-self-test-timeout-{}", std::process::id()));
+            test_temp_dir().join(format!("relswap-self-test-timeout-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let manager = self_test_manager(&APP, &root);
         write_self_test_script(&manager, &version, "sleep 10");
@@ -1794,7 +1794,7 @@ mod tests {
             }),
         };
         let version = Version::parse("1.2.3").unwrap();
-        let root = std::env::temp_dir().join(format!(
+        let root = test_temp_dir().join(format!(
             "relswap-self-test-descendant-{}",
             std::process::id()
         ));
@@ -1829,8 +1829,7 @@ mod tests {
             self_test: SELF_TEST,
         };
         let version = Version::parse("2.0.0").unwrap();
-        let root =
-            std::env::temp_dir().join(format!("relswap-self-test-update-{}", std::process::id()));
+        let root = test_temp_dir().join(format!("relswap-self-test-update-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let manager = self_test_manager(&APP, &root);
         write_self_test_payload(&manager, &version, "2.0.0");
@@ -1862,8 +1861,7 @@ mod tests {
             self_test: SELF_TEST,
         };
         let version = Version::parse("2.0.0").unwrap();
-        let root =
-            std::env::temp_dir().join(format!("relswap-self-test-stale-{}", std::process::id()));
+        let root = test_temp_dir().join(format!("relswap-self-test-stale-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let manager = self_test_manager(&APP, &root);
         write_self_test_payload(&manager, &version, "1.2.3");
