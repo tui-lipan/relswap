@@ -16,7 +16,7 @@ use semver::Version;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use url::Url;
@@ -310,6 +310,28 @@ impl<D: Downloader> Installation<D> {
         &self.command_path
     }
 
+    fn validate_configuration(&self) -> Result<()> {
+        if !executable::is_safe_basename(self.app.name, cfg!(windows)) {
+            return Err(InstallError::Invalid(
+                "application name must be a plain platform-safe basename".into(),
+            ));
+        }
+        #[cfg(windows)]
+        let launcher_name = {
+            if self.app.launcher_protocol() != Some(1) {
+                return Err(InstallError::Invalid(
+                    "Windows installations require launcher protocol 1".into(),
+                ));
+            }
+            Some(self.app.launcher_name().ok_or_else(|| {
+                InstallError::Invalid("Windows installations require launcher activation".into())
+            })?)
+        };
+        #[cfg(not(windows))]
+        let launcher_name = None;
+        validate_command_path(&self.root, &self.command_path, launcher_name)
+    }
+
     fn read_pointer_unlocked(&self) -> Result<Option<Version>> {
         #[cfg(unix)]
         {
@@ -443,7 +465,14 @@ impl<D: Downloader> Installation<D> {
         fs_security::ensure_private_dir(&self.versions_dir())?;
         fs_security::ensure_private_dir(&self.staging_dir())?;
         #[cfg(windows)]
-        fs_security::ensure_private_dir(&self.bin_dir())?;
+        {
+            fs_security::ensure_private_dir(&self.bin_dir())?;
+            if let Some(parent) = self.command_path.parent()
+                && lexists(parent)?
+            {
+                self.validate_windows_command_parent(parent)?;
+            }
+        }
         Ok(())
     }
 
@@ -457,6 +486,8 @@ impl<D: Downloader> Installation<D> {
         #[cfg(windows)]
         {
             fs_security::ensure_private_dir(parent)?;
+            fs_security::ensure_private_dir(&self.bin_dir())?;
+            self.validate_windows_command_parent(parent)?;
         }
         #[cfg(unix)]
         {
@@ -471,6 +502,27 @@ impl<D: Downloader> Installation<D> {
                     parent.display()
                 )));
             }
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn validate_windows_command_parent(&self, parent: &Path) -> Result<()> {
+        if !executable::same_directory_object(parent, &self.bin_dir())? {
+            return Err(InstallError::Invalid(
+                "Windows launcher parent is not the managed bin directory".into(),
+            ));
+        }
+        let launcher_name = self.app.launcher_name().ok_or_else(|| {
+            InstallError::Invalid("Windows installations require launcher activation".into())
+        })?;
+        if executable::directory_is_case_sensitive(parent)?
+            && self.command_path.file_name() != Some(std::ffi::OsStr::new(launcher_name))
+        {
+            return Err(InstallError::Invalid(
+                "Windows launcher filename casing is noncanonical in a case-sensitive directory"
+                    .into(),
+            ));
         }
         Ok(())
     }
@@ -567,12 +619,100 @@ fn current_target() -> Result<release::ReleaseTarget> {
 }
 
 fn absolute_path(path: PathBuf) -> PathBuf {
-    if path.is_absolute() {
+    let absolute = if path.is_absolute() {
         path
     } else {
         std::env::current_dir()
             .map(|cwd| cwd.join(&path))
             .unwrap_or(path)
+    };
+    lexical_normalize(&absolute)
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
+}
+
+fn validate_command_path(
+    root: &Path,
+    command_path: &Path,
+    launcher_name: Option<&str>,
+) -> Result<()> {
+    if same_path(root, command_path) || path_starts_with(root, command_path) {
+        return Err(InstallError::Invalid(
+            "managed command path collides with the installation root".into(),
+        ));
+    }
+    for reserved in [
+        root.join(ACTIVE_PATH_NAME),
+        root.join(LOCK_FILE),
+        root.join(STAGING_DIR),
+        root.join(VERSIONS_DIR),
+        root.join(INSTALL_FILE),
+        root.join(PENDING_FILE),
+    ] {
+        if path_starts_with(command_path, &reserved) {
+            return Err(InstallError::Invalid(format!(
+                "managed command path collides with internal path {}",
+                reserved.display()
+            )));
+        }
+    }
+    if let Some(launcher_name) = launcher_name {
+        if !executable::is_safe_basename(launcher_name, true)
+            || Path::new(launcher_name)
+                .file_name()
+                .and_then(|name| name.to_str())
+                != Some(launcher_name)
+        {
+            return Err(InstallError::Invalid(
+                "Windows launcher name must be a plain basename".into(),
+            ));
+        }
+        let expected = root.join("bin").join(launcher_name);
+        if !same_path(command_path, &expected) {
+            return Err(InstallError::Invalid(format!(
+                "Windows launcher path must be exactly {}",
+                expected.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+const ACTIVE_PATH_NAME: &str = "active";
+
+fn path_starts_with(path: &Path, base: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let mut path = path.components();
+        let mut base = base.components();
+        loop {
+            match base.next() {
+                None => return true,
+                Some(expected) => match path.next() {
+                    Some(actual)
+                        if windows_component_eq(actual.as_os_str(), expected.as_os_str()) => {}
+                    _ => return false,
+                },
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        path.starts_with(base)
     }
 }
 
@@ -585,23 +725,25 @@ fn lexists(path: &Path) -> io::Result<bool> {
 }
 
 fn read_regular_limited(path: &Path, limit: usize) -> Result<Vec<u8>> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || executable::is_reparse_point(path)?
-    {
-        return Err(InstallError::Invalid(format!(
-            "not a regular file: {}",
-            path.display()
-        )));
-    }
+    let mut file = executable::open_regular_file_secure(path)?;
+    let metadata = file.metadata()?;
     if metadata.len() > limit as u64 {
         return Err(InstallError::Invalid(format!(
             "file is larger than its limit: {}",
             path.display()
         )));
     }
-    Ok(fs::read(path)?)
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.by_ref()
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(InstallError::Invalid(format!(
+            "file is larger than its limit: {}",
+            path.display()
+        )));
+    }
+    Ok(bytes)
 }
 
 fn verify_file_digest(
@@ -610,15 +752,15 @@ fn verify_file_digest(
     expected_hash: &str,
     label: &str,
 ) -> Result<()> {
-    executable::ensure_regular_file(path)?;
-    let metadata = fs::symlink_metadata(path)?;
+    let mut file = executable::open_regular_file_secure(path)?;
+    let metadata = file.metadata()?;
     if metadata.len() != expected_size {
         return Err(InstallError::Invalid(format!(
             "{label} size mismatch: expected {expected_size}, got {}",
             metadata.len()
         )));
     }
-    let actual = release::sha256_file(path)?;
+    let actual = release::sha256_reader(&mut file)?;
     if actual != expected_hash {
         return Err(InstallError::Invalid(format!(
             "{label} SHA-256 mismatch: expected {expected_hash}, got {actual}"
@@ -770,12 +912,36 @@ fn parse_pointer_version(root: &Path, pointer: &Path, payload_name: &str) -> Res
 fn same_path(left: &Path, right: &Path) -> bool {
     #[cfg(windows)]
     {
-        left.to_string_lossy()
-            .eq_ignore_ascii_case(&right.to_string_lossy())
+        let mut left = left.components();
+        let mut right = right.components();
+        loop {
+            match (left.next(), right.next()) {
+                (None, None) => return true,
+                (Some(left), Some(right))
+                    if windows_component_eq(left.as_os_str(), right.as_os_str()) => {}
+                _ => return false,
+            }
+        }
     }
     #[cfg(not(windows))]
     {
         left == right
+    }
+}
+
+#[cfg(windows)]
+fn windows_component_eq(left: &std::ffi::OsStr, right: &std::ffi::OsStr) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
+
+    let left = left.encode_wide().collect::<Vec<_>>();
+    let right = right.encode_wide().collect::<Vec<_>>();
+    let (Ok(left_len), Ok(right_len)) = (i32::try_from(left.len()), i32::try_from(right.len()))
+    else {
+        return false;
+    };
+    unsafe {
+        CompareStringOrdinal(left.as_ptr(), left_len, right.as_ptr(), right_len, 1) == CSTR_EQUAL
     }
 }
 
@@ -834,6 +1000,65 @@ mod tests {
             parse_pointer_version(&root, &root.join("versions/1.2.3/hyprmux.exe"), &payload)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn command_path_validation_rejects_internal_collisions() {
+        let root = Path::new("/managed/relswap");
+        assert!(validate_command_path(root, Path::new("/usr/local/bin/hyprmux"), None).is_ok());
+        for command in [
+            root.to_path_buf(),
+            root.join("active"),
+            root.join(".lock"),
+            root.join(".staging"),
+            root.join(".staging/transaction/payload"),
+            root.join("versions"),
+            root.join("versions/1.2.3/hyprmux"),
+            root.join("install.json"),
+            root.join("pending-activation.json"),
+        ] {
+            assert!(
+                validate_command_path(root, &command, None).is_err(),
+                "{}",
+                command.display()
+            );
+        }
+    }
+
+    #[test]
+    fn launcher_path_validation_requires_the_exact_root_bin_child() {
+        let root = Path::new("/managed/relswap");
+        let expected = root.join("bin/hyprmux-launcher.exe");
+        assert!(validate_command_path(root, &expected, Some("hyprmux-launcher.exe")).is_ok());
+        for command in [
+            root.join("hyprmux-launcher.exe"),
+            root.join("other/hyprmux-launcher.exe"),
+            root.join("bin/nested/hyprmux-launcher.exe"),
+            root.join("bin/other.exe"),
+            root.join("bin/../active"),
+        ] {
+            let command = lexical_normalize(&command);
+            assert!(
+                validate_command_path(root, &command, Some("hyprmux-launcher.exe")).is_err(),
+                "{}",
+                command.display()
+            );
+        }
+        for invalid_name in ["../launcher.exe", "name:stream", "CON.exe", "launcher.exe."] {
+            assert!(validate_command_path(root, &expected, Some(invalid_name)).is_err());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_comparison_matches_case_insensitive_filesystem_semantics() {
+        let root = PathBuf::from(r"C:\Users\Example\App");
+        let command = PathBuf::from(r"c:\users\example\app\BIN\HYPRMUX-LAUNCHER.EXE");
+        assert!(validate_command_path(&root, &command, Some("hyprmux-launcher.exe")).is_ok());
+        assert!(same_path(
+            Path::new(r"C:\Temp\File"),
+            Path::new(r"c:\TEMP\file")
+        ));
     }
 
     // Keep the fixture helpers local to this file: the production path always uses the caller's
@@ -1156,7 +1381,10 @@ mod tests {
             version
         ));
         let _ = fs::remove_dir_all(&root);
+        #[cfg(unix)]
         let command = root.join("command-dir/hyprmux");
+        #[cfg(windows)]
+        let command = root.join("bin/hyprmux-launcher.exe");
         let manager = Installation::new(&TEST_APP, &root, &command, downloader, NoFaultInjector)
             .with_trusted_keys(vec![trusted]);
         let result = manager.install_version(version.clone()).unwrap();
@@ -1212,7 +1440,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("relswap-win-primitives-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
-        let command = root.join("bin").join("hyprmux.exe");
+        let command = root.join("bin").join("hyprmux-launcher.exe");
         let manager = Installation::new(
             &TEST_APP,
             &root,
@@ -1244,6 +1472,24 @@ mod tests {
             .expect("stage: atomic_replace_file selector");
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn invalid_windows_launcher_path_is_rejected_before_root_creation() {
+        let root =
+            std::env::temp_dir().join(format!("relswap-invalid-win-path-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let manager = Installation::new(
+            &TEST_APP,
+            &root,
+            root.join("elsewhere/hyprmux-launcher.exe"),
+            FixtureDownloader::default(),
+            NoFaultInjector,
+        );
+        let error = manager.recover().unwrap_err();
+        assert!(error.to_string().contains("must be exactly"));
+        assert!(!root.exists());
     }
 
     #[cfg(unix)]
@@ -1400,6 +1646,21 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn write_self_test_script(
+        manager: &Installation<FixtureDownloader>,
+        version: &Version,
+        script: &str,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let payload = manager.payload_path(version);
+        fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        fs::create_dir_all(manager.command_path().parent().unwrap()).unwrap();
+        fs::write(&payload, format!("#!/bin/sh\n{script}\n")).unwrap();
+        fs::set_permissions(&payload, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
     const SELF_TEST: Option<crate::SelfTest> = Some(crate::SelfTest {
         args: &["--version"],
         timeout: std::time::Duration::from_secs(5),
@@ -1452,6 +1713,103 @@ mod tests {
         assert!(error.to_string().contains("output mismatch"));
         assert!(!manager.command_path().exists());
         assert!(!manager.pending_path().exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn self_test_rejects_excessive_combined_output() {
+        static APP: App = App {
+            name: "hyprmux",
+            version: "1.2.3",
+            repository_url: "https://example.test/",
+            trust_anchor: br#"{"schema_version":1,"keys":[]}"#,
+            activation: ActivationStrategy::UnixSymlink,
+            self_test: SELF_TEST,
+        };
+        let version = Version::parse("1.2.3").unwrap();
+        let root =
+            std::env::temp_dir().join(format!("relswap-self-test-output-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let manager = self_test_manager(&APP, &root);
+        write_self_test_script(
+            &manager,
+            &version,
+            "dd if=/dev/zero bs=4096 count=300 2>/dev/null",
+        );
+
+        let error = manager
+            .activate_pointer_and_state(None, version, "a".repeat(64), None, None, None)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("output exceeds"));
+        assert!(!manager.command_path().exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn self_test_timeout_bounds_process_and_output_collection() {
+        static APP: App = App {
+            name: "hyprmux",
+            version: "1.2.3",
+            repository_url: "https://example.test/",
+            trust_anchor: br#"{"schema_version":1,"keys":[]}"#,
+            activation: ActivationStrategy::UnixSymlink,
+            self_test: Some(crate::SelfTest {
+                args: &[],
+                timeout: std::time::Duration::from_millis(150),
+            }),
+        };
+        let version = Version::parse("1.2.3").unwrap();
+        let root =
+            std::env::temp_dir().join(format!("relswap-self-test-timeout-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let manager = self_test_manager(&APP, &root);
+        write_self_test_script(&manager, &version, "sleep 10");
+        let started = std::time::Instant::now();
+
+        let error = manager
+            .activate_pointer_and_state(None, version, "a".repeat(64), None, None, None)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        assert!(!manager.command_path().exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn self_test_timeout_handles_descendant_retaining_output_pipes() {
+        static APP: App = App {
+            name: "hyprmux",
+            version: "1.2.3",
+            repository_url: "https://example.test/",
+            trust_anchor: br#"{"schema_version":1,"keys":[]}"#,
+            activation: ActivationStrategy::UnixSymlink,
+            self_test: Some(crate::SelfTest {
+                args: &[],
+                timeout: std::time::Duration::from_millis(250),
+            }),
+        };
+        let version = Version::parse("1.2.3").unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "relswap-self-test-descendant-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let manager = self_test_manager(&APP, &root);
+        write_self_test_script(&manager, &version, "sleep 10 & printf 'hyprmux 1.2.3\\n'");
+        let started = std::time::Instant::now();
+
+        let error = manager
+            .activate_pointer_and_state(None, version, "a".repeat(64), None, None, None)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        assert!(!manager.command_path().exists());
         let _ = fs::remove_dir_all(root);
     }
 

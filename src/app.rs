@@ -41,6 +41,7 @@ pub enum ActivationStrategy {
 /// contain the canonical string of the version being activated. Catches correctly signed binaries
 /// that cannot run on the host (for example a glibc mismatch) and binaries that do not report the
 /// version the manifest claims they are.
+/// Output collection is part of the timeout and combined output is limited to 1 MiB.
 ///
 /// The expected substring is always derived from the version under activation, never from
 /// [`App::version`]: during an update the staged payload is a *different* version than the running
@@ -49,7 +50,7 @@ pub enum ActivationStrategy {
 pub struct SelfTest {
     /// Arguments passed to the staged payload (for example `&["--version"]`).
     pub args: &'static [&'static str],
-    /// Wall-clock timeout for the probe process.
+    /// Wall-clock timeout for spawning, running, and collecting output from the probe.
     pub timeout: std::time::Duration,
 }
 

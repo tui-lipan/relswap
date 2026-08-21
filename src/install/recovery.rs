@@ -10,6 +10,7 @@ impl<D: Downloader> Installation<D> {
     /// Recover an interrupted activation if the installation root already exists.  An absent root
     /// is the normal unmanaged state and returns `false` without creating any files.
     pub fn recover_if_managed(&self) -> Result<bool> {
+        self.validate_configuration()?;
         if !lexists(&self.root)? {
             return Ok(false);
         }
@@ -188,7 +189,6 @@ impl<D: Downloader> Installation<D> {
             signed.is_none()
                 || !launcher.owned
                 || launcher.protocol != 1
-                || launcher.path != self.command_path.to_string_lossy()
                 || self.verify_installed_launcher_record(launcher).is_err()
         }
     }

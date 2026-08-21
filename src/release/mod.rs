@@ -41,6 +41,16 @@ pub const MAX_ARCHIVE_SIZE: u64 = 256 * 1024 * 1024;
 pub const MAX_MEMBER_SIZE: u64 = 256 * 1024 * 1024;
 /// Maximum uncompressed bytes inspected in one archive.
 pub const MAX_UNCOMPRESSED_SIZE: u64 = 256 * 1024 * 1024;
+/// Maximum number of members, including directories and empty files, inspected in one archive.
+pub const MAX_ARCHIVE_MEMBERS: usize = 4096;
+/// Maximum UTF-8 byte length accepted for one archive member name.
+pub const MAX_ARCHIVE_MEMBER_NAME: usize = 4096;
+/// Maximum aggregate ZIP central-directory name, extra-field, and comment bytes.
+pub const MAX_ARCHIVE_METADATA_SIZE: usize = 8 * 1024 * 1024;
+/// Maximum payload accepted for one GNU long-name or local PAX metadata record.
+pub const MAX_TAR_METADATA_SIZE: u64 = 64 * 1024;
+/// Maximum decompressed tar bytes processed, including headers, padding, and metadata records.
+pub const MAX_TAR_DECOMPRESSED_SIZE: u64 = MAX_UNCOMPRESSED_SIZE + 32 * 1024 * 1024;
 /// Maximum metadata or detached-signature response body.
 pub const MAX_METADATA_SIZE: usize = 1024 * 1024;
 
@@ -139,7 +149,7 @@ pub fn sha256_reader<R: Read>(reader: &mut R) -> io::Result<String> {
 
 /// Hash a file without loading it into memory as a whole.
 pub fn sha256_file(path: &Path) -> io::Result<String> {
-    let mut file = std::fs::File::open(path)?;
+    let mut file = crate::fs::executable::open_regular_file_secure(path)?;
     sha256_reader(&mut file)
 }
 
@@ -191,29 +201,20 @@ pub(crate) fn verify_bytes(
 }
 
 pub(crate) fn path_is_safe_directory(path: &Path) -> std::result::Result<(), ReleaseError> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(ReleaseError::archive(format!(
-            "refusing to extract through symlink {}",
+    #[cfg(windows)]
+    crate::fs::security::ensure_private_dir(path).map_err(|error| {
+        ReleaseError::archive(format!(
+            "Windows extraction destination is not private {}: {error}",
             path.display()
-        ))),
-        Ok(metadata) if !metadata.is_dir() => Err(ReleaseError::archive(format!(
-            "extraction destination is not a directory: {}",
+        ))
+    })?;
+    crate::fs::executable::ensure_directory_tree(path).map_err(|error| {
+        ReleaseError::archive(format!(
+            "unsafe extraction destination {}: {error}",
             path.display()
-        ))),
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(path)?;
-            let metadata = std::fs::symlink_metadata(path)?;
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                return Err(ReleaseError::archive(format!(
-                    "invalid extraction destination: {}",
-                    path.display()
-                )));
-            }
-            Ok(())
-        }
-        Err(error) => Err(error.into()),
-    }
+        ))
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]

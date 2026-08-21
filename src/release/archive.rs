@@ -3,14 +3,15 @@
 use super::manifest::ReleaseAsset;
 use super::target::Target;
 use super::{
-    MAX_ARCHIVE_SIZE, MAX_MEMBER_SIZE, MAX_UNCOMPRESSED_SIZE, ReleaseError, Result,
-    path_is_safe_directory, read_limited, sha256_bytes, verify_bytes,
+    MAX_ARCHIVE_MEMBER_NAME, MAX_ARCHIVE_MEMBERS, MAX_ARCHIVE_METADATA_SIZE, MAX_ARCHIVE_SIZE,
+    MAX_MEMBER_SIZE, MAX_TAR_DECOMPRESSED_SIZE, MAX_TAR_METADATA_SIZE, MAX_UNCOMPRESSED_SIZE,
+    ReleaseError, Result, path_is_safe_directory, read_limited, verify_bytes,
 };
 use crate::App;
+use crate::fs::executable;
 use flate2::read::GzDecoder;
 use std::collections::HashSet;
-use std::fs::{self, OpenOptions};
-use std::io::{Cursor, Read, Write};
+use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
 use zip::CompressionMethod;
 
@@ -53,7 +54,8 @@ pub fn verify_archive_bytes(app: &App, bytes: &[u8], asset: &ReleaseAsset) -> Re
 
 /// Read and verify an archive file before parsing it.
 pub fn verify_archive_file(app: &App, path: &Path, asset: &ReleaseAsset) -> Result<()> {
-    let metadata = fs::metadata(path)?;
+    let mut file = executable::open_regular_file_secure(path)?;
+    let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(ReleaseError::archive(format!(
             "release archive is not a regular file: {}",
@@ -65,7 +67,6 @@ pub fn verify_archive_file(app: &App, path: &Path, asset: &ReleaseAsset) -> Resu
             "archive exceeds maximum size {MAX_ARCHIVE_SIZE}"
         )));
     }
-    let mut file = fs::File::open(path)?;
     let bytes = read_limited(&mut file, MAX_ARCHIVE_SIZE)?;
     verify_archive_bytes(app, &bytes, asset)
 }
@@ -93,17 +94,65 @@ pub fn extract_archive(
     let release = inspect_archive(app, bytes, asset)?;
     let target = target_from_asset(app, asset)?;
     path_is_safe_directory(destination)?;
-    let payload_path = write_member(destination, &release.payload, &target.payload_name(app))?;
-    let launcher_path = match &release.launcher {
-        Some(launcher) => Some(write_member(
-            destination,
-            launcher,
+    let destination_handle =
+        executable::open_extraction_directory(destination).map_err(|error| {
+            ReleaseError::archive(format!(
+                "could not open extraction destination {}: {error}",
+                destination.display()
+            ))
+        })?;
+    let payload_name = target.payload_name(app);
+    let launcher_name = if release.launcher.is_some() {
+        Some(
             target
                 .launcher_name(app)
                 .ok_or_else(|| ReleaseError::archive("app does not configure a launcher"))?,
-        )?),
+        )
+    } else {
+        None
+    };
+    let payload_path = write_member(&destination_handle, &release.payload, &payload_name)?;
+    let launcher_path = match &release.launcher {
+        Some(launcher) => {
+            let name = launcher_name.expect("launcher name checked before payload creation");
+            match write_member(&destination_handle, launcher, name) {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    if let Err(cleanup) = destination_handle.remove_file(&payload_name) {
+                        return Err(ReleaseError::archive(format!(
+                            "{error}; payload rollback failed: {cleanup}"
+                        )));
+                    }
+                    return Err(error);
+                }
+            }
+        }
         None => None,
     };
+    let destination_identity = destination_handle.path_still_identifies_directory();
+    if !matches!(destination_identity, Ok(true)) {
+        let mut cleanup_errors = Vec::new();
+        if let Some(name) = launcher_name
+            && let Err(error) = destination_handle.remove_file(name)
+        {
+            cleanup_errors.push(format!("launcher cleanup failed: {error}"));
+        }
+        if let Err(error) = destination_handle.remove_file(&payload_name) {
+            cleanup_errors.push(format!("payload cleanup failed: {error}"));
+        }
+        let reason = match destination_identity {
+            Ok(false) => "extraction destination pathname changed during extraction".to_string(),
+            Err(error) => format!("could not revalidate extraction destination: {error}"),
+            Ok(true) => unreachable!(),
+        };
+        if cleanup_errors.is_empty() {
+            return Err(ReleaseError::archive(reason));
+        }
+        return Err(ReleaseError::archive(format!(
+            "{reason}; {}",
+            cleanup_errors.join("; ")
+        )));
+    }
     Ok(ExtractedPaths {
         payload: payload_path,
         launcher: launcher_path,
@@ -117,14 +166,14 @@ pub fn extract_archive_file(
     asset: &ReleaseAsset,
     destination: &Path,
 ) -> Result<ExtractedPaths> {
-    let metadata = fs::metadata(archive_path)?;
+    let mut file = executable::open_regular_file_secure(archive_path)?;
+    let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.len() > MAX_ARCHIVE_SIZE {
         return Err(ReleaseError::archive(format!(
             "invalid or oversized release archive: {}",
             archive_path.display()
         )));
     }
-    let mut file = fs::File::open(archive_path)?;
     let bytes = read_limited(&mut file, MAX_ARCHIVE_SIZE)?;
     extract_archive(app, &bytes, asset, destination)
 }
@@ -142,30 +191,126 @@ fn inspect_tar_gz(app: &App, bytes: &[u8], asset: &ReleaseAsset) -> Result<Extra
     let target = target_from_asset(app, asset)?;
     let version = canonical_version_from_asset(app, asset, target);
     let root = target.root_name(app, &version);
-    let mut archive = tar::Archive::new(GzDecoder::new(Cursor::new(bytes)));
+    let mut archive = DecompressedLimit::new(
+        GzDecoder::new(Cursor::new(bytes)),
+        MAX_TAR_DECOMPRESSED_SIZE,
+    );
     let mut names = HashSet::new();
     let mut total_uncompressed = 0u64;
     let mut payload = None;
     let mut launcher = None;
     let mut root_seen = false;
     let expected_launcher = target.launcher_path(app, &version);
-
-    let entries = archive
-        .entries()
-        .map_err(|error| ReleaseError::archive(format!("invalid tar archive: {error}")))?;
-    for (index, entry) in entries.enumerate() {
-        let mut entry = entry.map_err(|error| {
-            ReleaseError::archive(format!("invalid tar entry {index}: {error}"))
+    let mut pending_long_name: Option<Vec<u8>> = None;
+    let mut pending_long_link: Option<Vec<u8>> = None;
+    let mut pending_pax: Option<Vec<u8>> = None;
+    let mut global_pax = OwnedPaxOverrides::default();
+    let mut index = 0usize;
+    loop {
+        let mut block = [0u8; 512];
+        archive.read_exact(&mut block).map_err(|error| {
+            ReleaseError::archive(format!("invalid tar header at index {index}: {error}"))
         })?;
-        let raw_path = entry.path_bytes().into_owned();
+        if block.iter().all(|byte| *byte == 0) {
+            if pending_long_name.is_some() || pending_long_link.is_some() || pending_pax.is_some() {
+                return Err(ReleaseError::archive(
+                    "tar metadata record has no following member",
+                ));
+            }
+            let mut trailing = [0u8; 8192];
+            loop {
+                let read = archive.read(&mut trailing).map_err(|error| {
+                    ReleaseError::archive(format!("invalid trailing tar data: {error}"))
+                })?;
+                if read == 0 {
+                    break;
+                }
+                if trailing[..read].iter().any(|byte| *byte != 0) {
+                    return Err(ReleaseError::archive(
+                        "tar archive has nonzero data after its end marker",
+                    ));
+                }
+            }
+            break;
+        }
+        if index >= MAX_ARCHIVE_MEMBERS {
+            return Err(ReleaseError::archive(format!(
+                "tar archive exceeds maximum member count {MAX_ARCHIVE_MEMBERS}"
+            )));
+        }
+        validate_tar_checksum(&block, index)?;
+        let mut header = tar::Header::new_old();
+        header.as_mut_bytes().copy_from_slice(&block);
+        let entry_type = header.entry_type();
+        let header_size = header.size().map_err(|error| {
+            ReleaseError::archive(format!("invalid tar member size at index {index}: {error}"))
+        })?;
+        if entry_type.is_gnu_longname()
+            || entry_type.is_gnu_longlink()
+            || entry_type.is_pax_local_extensions()
+            || entry_type.is_pax_global_extensions()
+        {
+            if header_size > MAX_TAR_METADATA_SIZE {
+                return Err(ReleaseError::archive(format!(
+                    "tar metadata at index {index} exceeds {MAX_TAR_METADATA_SIZE} bytes"
+                )));
+            }
+            let data = read_tar_record(&mut archive, header_size, index)?;
+            if entry_type.is_gnu_longname() {
+                if pending_long_name.replace(data).is_some() {
+                    return Err(ReleaseError::archive(
+                        "duplicate GNU long-name metadata for one tar member",
+                    ));
+                }
+            } else if entry_type.is_gnu_longlink() {
+                if pending_long_link.replace(data).is_some() {
+                    return Err(ReleaseError::archive(
+                        "duplicate GNU long-link metadata for one tar member",
+                    ));
+                }
+            } else if entry_type.is_pax_local_extensions() {
+                pax_overrides(&data, index)?;
+                if pending_pax.replace(data).is_some() {
+                    return Err(ReleaseError::archive(
+                        "duplicate local PAX metadata for one tar member",
+                    ));
+                }
+            } else {
+                global_pax.update(pax_overrides(&data, index)?);
+            }
+            index += 1;
+            continue;
+        }
+        let pax = match pending_pax.as_deref() {
+            Some(data) => pax_overrides(data, index)?,
+            None => PaxOverrides::default(),
+        };
+        let declared_size = match pax.size {
+            Some(size) => size,
+            None => global_pax.size,
+        }
+        .unwrap_or(header_size);
+        let pax_path = match pax.path {
+            Some(path) => path,
+            None => global_pax.path.as_deref(),
+        };
+        let header_path = header.path_bytes();
+        let raw_path = pending_long_name
+            .as_deref()
+            .map(trim_tar_nul)
+            .or(pax_path)
+            .unwrap_or(header_path.as_ref())
+            .to_vec();
         let path = validate_member_name(&raw_path, &root, index)?;
+        pending_long_name = None;
+        pending_long_link = None;
+        pending_pax = None;
         if !names.insert(path.clone()) {
             return Err(ReleaseError::archive(format!(
                 "duplicate archive member: {path}"
             )));
         }
 
-        let entry_type = entry.header().entry_type();
         if entry_type.is_symlink()
             || entry_type.is_hard_link()
             || entry_type.is_character_special()
@@ -185,7 +330,6 @@ fn inspect_tar_gz(app: &App, bytes: &[u8], asset: &ReleaseAsset) -> Result<Extra
             )));
         }
 
-        let declared_size = entry.size();
         if declared_size > MAX_MEMBER_SIZE {
             return Err(ReleaseError::archive(format!(
                 "tar member {path} exceeds maximum size {MAX_MEMBER_SIZE}"
@@ -200,6 +344,7 @@ fn inspect_tar_gz(app: &App, bytes: &[u8], asset: &ReleaseAsset) -> Result<Extra
             if path == root {
                 root_seen = true;
             }
+            index += 1;
             continue;
         }
         if path == root {
@@ -227,9 +372,27 @@ fn inspect_tar_gz(app: &App, bytes: &[u8], asset: &ReleaseAsset) -> Result<Extra
         } else {
             None
         };
-        let data = read_member_data(&mut entry, declared_size, expected.is_some(), &path)?;
+        let mut member_reader = archive.by_ref().take(declared_size);
+        let data = read_member_data(&mut member_reader, declared_size, expected.is_some(), &path)?;
+        let padding = (512 - declared_size % 512) % 512;
+        if padding != 0 {
+            let mut padding_bytes = [0u8; 512];
+            archive
+                .read_exact(&mut padding_bytes[..padding as usize])
+                .map_err(|error| {
+                    ReleaseError::archive(format!("truncated tar padding after {path}: {error}"))
+                })?;
+            if padding_bytes[..padding as usize]
+                .iter()
+                .any(|byte| *byte != 0)
+            {
+                return Err(ReleaseError::archive(format!(
+                    "nonzero tar padding after {path}"
+                )));
+            }
+        }
         if let Some((expected_size, expected_hash, is_payload)) = expected {
-            if entry.header().mode().unwrap_or_default() & 0o111 == 0 {
+            if header.mode().unwrap_or_default() & 0o111 == 0 {
                 return Err(ReleaseError::archive(format!(
                     "expected executable member is not executable: {path}"
                 )));
@@ -242,6 +405,7 @@ fn inspect_tar_gz(app: &App, bytes: &[u8], asset: &ReleaseAsset) -> Result<Extra
                 launcher = Some(member);
             }
         }
+        index += 1;
     }
     if !root_seen {
         return Err(ReleaseError::archive(format!(
@@ -255,8 +419,14 @@ fn inspect_zip(app: &App, bytes: &[u8], asset: &ReleaseAsset) -> Result<Extracte
     let target = target_from_asset(app, asset)?;
     let version = canonical_version_from_asset(app, asset, target);
     let root = target.root_name(app, &version);
+    preflight_zip_member_count(bytes)?;
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
         .map_err(|error| ReleaseError::archive(format!("invalid ZIP archive: {error}")))?;
+    if archive.len() > MAX_ARCHIVE_MEMBERS {
+        return Err(ReleaseError::archive(format!(
+            "ZIP archive exceeds maximum member count {MAX_ARCHIVE_MEMBERS}"
+        )));
+    }
     let mut names = HashSet::new();
     let mut total_uncompressed = 0u64;
     let mut payload = None;
@@ -433,7 +603,11 @@ fn finish_members(
 }
 
 fn validate_member_name(raw: &[u8], root: &str, index: usize) -> Result<String> {
-    if raw.is_empty() || raw.contains(&0) || raw.contains(&b'\\') {
+    if raw.is_empty()
+        || raw.len() > MAX_ARCHIVE_MEMBER_NAME
+        || raw.contains(&0)
+        || raw.contains(&b'\\')
+    {
         return Err(ReleaseError::archive(format!(
             "malformed archive member name at index {index}"
         )));
@@ -472,68 +646,303 @@ fn validate_member_name(raw: &[u8], root: &str, index: usize) -> Result<String> 
     Ok(without_trailing_slash.to_string())
 }
 
-fn write_member(destination: &Path, member: &VerifiedMember, filename: &str) -> Result<PathBuf> {
-    if filename.is_empty() || filename.contains('/') || filename.contains('\\') {
-        return Err(ReleaseError::archive("invalid output filename"));
-    }
-    let output = destination.join(filename);
-    match fs::symlink_metadata(&output) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(ReleaseError::archive(format!(
-                "refusing to overwrite symlink {}",
-                output.display()
-            )));
-        }
-        Ok(metadata) if !metadata.is_file() => {
-            return Err(ReleaseError::archive(format!(
-                "refusing to overwrite non-file {}",
-                output.display()
-            )));
-        }
-        Ok(metadata) => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                if metadata.nlink() > 1 {
-                    return Err(ReleaseError::archive(format!(
-                        "refusing to overwrite hard-linked file {}",
-                        output.display()
-                    )));
-                }
+fn write_member(
+    destination: &executable::OpenDirectory,
+    member: &VerifiedMember,
+    filename: &str,
+) -> Result<PathBuf> {
+    destination
+        .create_new_file(filename, &member.data, Some(0o755))
+        .map_err(|error| {
+            ReleaseError::archive(format!(
+                "could not create extracted member {filename}: {error}"
+            ))
+        })
+}
+
+fn validate_tar_checksum(block: &[u8; 512], index: usize) -> Result<()> {
+    let mut header = tar::Header::new_old();
+    header.as_mut_bytes().copy_from_slice(block);
+    let expected = header.cksum().map_err(|error| {
+        ReleaseError::archive(format!("invalid tar checksum at index {index}: {error}"))
+    })?;
+    let actual = block
+        .iter()
+        .enumerate()
+        .map(|(offset, byte)| {
+            if (148..156).contains(&offset) {
+                u32::from(b' ')
+            } else {
+                u32::from(*byte)
             }
-            #[cfg(not(unix))]
-            let _ = metadata;
+        })
+        .sum::<u32>();
+    if actual != expected {
+        return Err(ReleaseError::archive(format!(
+            "tar checksum mismatch at index {index}"
+        )));
+    }
+    Ok(())
+}
+
+fn read_tar_record<R: Read>(reader: &mut R, size: u64, index: usize) -> Result<Vec<u8>> {
+    let mut record = reader.by_ref().take(size);
+    let data = read_member_data(
+        &mut record,
+        size,
+        true,
+        &format!("tar metadata at index {index}"),
+    )?;
+    let padding = (512 - size % 512) % 512;
+    if padding != 0 {
+        let mut bytes = [0u8; 512];
+        reader
+            .read_exact(&mut bytes[..padding as usize])
+            .map_err(|error| {
+                ReleaseError::archive(format!(
+                    "truncated tar metadata padding at index {index}: {error}"
+                ))
+            })?;
+        if bytes[..padding as usize].iter().any(|byte| *byte != 0) {
+            return Err(ReleaseError::archive(format!(
+                "nonzero tar metadata padding at index {index}"
+            )));
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
     }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&output)?;
-    file.write_all(&member.data)?;
-    file.flush()?;
-    drop(file);
-    let metadata = fs::metadata(&output)?;
-    if metadata.len() != member.data.len() as u64 {
-        return Err(ReleaseError::archive(format!(
-            "written member size mismatch: {}",
-            output.display()
-        )));
+    Ok(data)
+}
+
+fn trim_tar_nul(value: &[u8]) -> &[u8] {
+    value.strip_suffix(&[0]).unwrap_or(value)
+}
+
+#[derive(Default)]
+struct PaxOverrides<'a> {
+    path: Option<Option<&'a [u8]>>,
+    size: Option<Option<u64>>,
+}
+
+#[derive(Default)]
+struct OwnedPaxOverrides {
+    path: Option<Vec<u8>>,
+    size: Option<u64>,
+}
+
+impl OwnedPaxOverrides {
+    fn update(&mut self, overrides: PaxOverrides<'_>) {
+        if let Some(path) = overrides.path {
+            self.path = path.map(<[u8]>::to_vec);
+        }
+        if let Some(size) = overrides.size {
+            self.size = size;
+        }
     }
-    if sha256_bytes(&member.data) != sha256_bytes(&fs::read(&output)?) {
-        return Err(ReleaseError::archive(format!(
-            "written member hash mismatch: {}",
-            output.display()
-        )));
+}
+
+fn pax_overrides(data: &[u8], index: usize) -> Result<PaxOverrides<'_>> {
+    let mut cursor = 0usize;
+    let mut overrides = PaxOverrides::default();
+    while cursor < data.len() {
+        let relative_space = data[cursor..]
+            .iter()
+            .position(|byte| *byte == b' ')
+            .ok_or_else(|| {
+                ReleaseError::archive(format!("malformed PAX record at tar index {index}"))
+            })?;
+        let space = cursor + relative_space;
+        let length = std::str::from_utf8(&data[cursor..space])
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .ok_or_else(|| {
+                ReleaseError::archive(format!("invalid PAX length at tar index {index}"))
+            })?;
+        let end = cursor
+            .checked_add(length)
+            .filter(|end| *end <= data.len())
+            .ok_or_else(|| {
+                ReleaseError::archive(format!("oversized PAX record at tar index {index}"))
+            })?;
+        if end <= space + 1 || data[end - 1] != b'\n' {
+            return Err(ReleaseError::archive(format!(
+                "malformed PAX record at tar index {index}"
+            )));
+        }
+        let field = &data[space + 1..end - 1];
+        let equals = field.iter().position(|byte| *byte == b'=').ok_or_else(|| {
+            ReleaseError::archive(format!("malformed PAX field at tar index {index}"))
+        })?;
+        let key = &field[..equals];
+        let value = &field[equals + 1..];
+        if key == b"path" {
+            overrides.path = Some((!value.is_empty()).then_some(value));
+        }
+        if key == b"size" {
+            overrides.size = Some(if value.is_empty() {
+                None
+            } else {
+                Some(
+                    std::str::from_utf8(value)
+                        .ok()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .ok_or_else(|| {
+                            ReleaseError::archive(format!("invalid PAX size at tar index {index}"))
+                        })?,
+                )
+            });
+        }
+        cursor = end;
     }
-    #[cfg(unix)]
+    Ok(overrides)
+}
+
+fn preflight_zip_member_count(bytes: &[u8]) -> Result<()> {
+    const EOCD_SIGNATURE: &[u8; 4] = b"PK\x05\x06";
+    const EOCD_SIZE: usize = 22;
+    const MAX_COMMENT: usize = u16::MAX as usize;
+
+    let search_start = bytes.len().saturating_sub(EOCD_SIZE + MAX_COMMENT);
+    for (relative, window) in bytes[search_start..]
+        .windows(EOCD_SIGNATURE.len())
+        .enumerate()
+        .rev()
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&output, fs::Permissions::from_mode(0o755))?;
+        if window != EOCD_SIGNATURE {
+            continue;
+        }
+        let offset = search_start + relative;
+        let Some(record) = bytes.get(offset..offset + EOCD_SIZE) else {
+            continue;
+        };
+        let short = |start: usize| u16::from_le_bytes([record[start], record[start + 1]]);
+        let long = |start: usize| {
+            u32::from_le_bytes([
+                record[start],
+                record[start + 1],
+                record[start + 2],
+                record[start + 3],
+            ])
+        };
+        if offset + EOCD_SIZE + short(20) as usize != bytes.len()
+            || short(4) != 0
+            || short(6) != 0
+            || short(8) != short(10)
+        {
+            continue;
+        }
+        if short(10) == u16::MAX || long(12) == u32::MAX || long(16) == u32::MAX {
+            return Err(ReleaseError::archive(
+                "ZIP64 archives are not supported for release assets",
+            ));
+        }
+        let central_start = long(16) as usize;
+        let Some(central_end) = central_start.checked_add(long(12) as usize) else {
+            continue;
+        };
+        if central_end != offset {
+            continue;
+        }
+        let Some(actual_members) = zip_central_member_count(bytes, central_start, central_end)?
+        else {
+            continue;
+        };
+        if actual_members != usize::from(short(10)) {
+            continue;
+        }
+        if actual_members > MAX_ARCHIVE_MEMBERS {
+            return Err(ReleaseError::archive(format!(
+                "ZIP archive exceeds maximum member count {MAX_ARCHIVE_MEMBERS}"
+            )));
+        }
+        return Ok(());
     }
-    Ok(output)
+    Err(ReleaseError::archive(
+        "ZIP archive has no valid end-of-directory record",
+    ))
+}
+
+fn zip_central_member_count(bytes: &[u8], start: usize, end: usize) -> Result<Option<usize>> {
+    const CENTRAL_SIGNATURE: &[u8; 4] = b"PK\x01\x02";
+    const CENTRAL_HEADER_SIZE: usize = 46;
+
+    let mut cursor = start;
+    let mut members = 0usize;
+    let mut metadata_size = 0usize;
+    while cursor < end {
+        let Some(header) = bytes.get(cursor..cursor + CENTRAL_HEADER_SIZE) else {
+            return Ok(None);
+        };
+        if &header[..4] != CENTRAL_SIGNATURE {
+            return Ok(None);
+        }
+        let short = |offset: usize| u16::from_le_bytes([header[offset], header[offset + 1]]);
+        let name_size = usize::from(short(28));
+        if name_size > MAX_ARCHIVE_MEMBER_NAME {
+            return Err(ReleaseError::archive(format!(
+                "ZIP member name exceeds {MAX_ARCHIVE_MEMBER_NAME} bytes"
+            )));
+        }
+        let variable = name_size
+            .checked_add(usize::from(short(30)))
+            .and_then(|size| size.checked_add(usize::from(short(32))))
+            .ok_or_else(|| ReleaseError::archive("ZIP central metadata size overflow"))?;
+        metadata_size = metadata_size
+            .checked_add(variable)
+            .ok_or_else(|| ReleaseError::archive("ZIP central metadata size overflow"))?;
+        if metadata_size > MAX_ARCHIVE_METADATA_SIZE {
+            return Err(ReleaseError::archive(format!(
+                "ZIP central metadata exceeds {MAX_ARCHIVE_METADATA_SIZE} bytes"
+            )));
+        }
+        let Some(next) = cursor.checked_add(CENTRAL_HEADER_SIZE + variable) else {
+            return Ok(None);
+        };
+        cursor = next;
+        if cursor > end {
+            return Ok(None);
+        }
+        members += 1;
+        if members > MAX_ARCHIVE_MEMBERS {
+            return Ok(Some(members));
+        }
+    }
+    Ok((cursor == end).then_some(members))
+}
+
+struct DecompressedLimit<R> {
+    inner: R,
+    remaining: u64,
+}
+
+impl<R> DecompressedLimit<R> {
+    fn new(inner: R, limit: u64) -> Self {
+        Self {
+            inner,
+            remaining: limit,
+        }
+    }
+}
+
+impl<R: Read> Read for DecompressedLimit<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            let mut excess = [0u8; 1];
+            return match self.inner.read(&mut excess)? {
+                0 => Ok(0),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "decompressed tar exceeds processing limit",
+                )),
+            };
+        }
+        let allowed =
+            usize::try_from(self.remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+        let read = self.inner.read(&mut buffer[..allowed])?;
+        self.remaining -= read as u64;
+        Ok(read)
+    }
 }
 
 fn validate_asset_against_manifest_shape(app: &App, asset: &ReleaseAsset) -> Result<()> {
@@ -615,9 +1024,9 @@ fn canonical_version_from_archive_name(app: &App, name: &str, target: Target) ->
 mod tests {
     use super::*;
     use crate::ActivationStrategy;
-    use crate::release::Target;
+    use crate::release::{Target, sha256_bytes};
     use flate2::{Compression, write::GzEncoder};
-    use std::io::Cursor;
+    use std::io::{Cursor, Write};
     use tar::Builder;
     use zip::write::{SimpleFileOptions, ZipWriter};
 
@@ -635,6 +1044,31 @@ mod tests {
         },
         self_test: None,
     };
+
+    fn append_test_root<W: Write>(builder: &mut Builder<W>, root: &str) {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_size(0);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder
+            .append_data(
+                &mut header,
+                format!("{root}/"),
+                Cursor::new(Vec::<u8>::new()),
+            )
+            .unwrap();
+    }
+
+    fn append_test_payload<W: Write>(builder: &mut Builder<W>, path: &str) {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(3);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, path, Cursor::new(b"bin"))
+            .unwrap();
+    }
 
     fn tar_archive(_version: &semver::Version, path: &str, data: &[u8]) -> Vec<u8> {
         let root = path.split('/').next().unwrap_or(path);
@@ -767,6 +1201,351 @@ mod tests {
     }
 
     #[test]
+    fn decompression_limit_is_inclusive_at_exact_boundary() {
+        let mut exact = DecompressedLimit::new(Cursor::new(b"abc"), 3);
+        let mut output = Vec::new();
+        exact.read_to_end(&mut output).unwrap();
+        assert_eq!(output, b"abc");
+
+        let mut excessive = DecompressedLimit::new(Cursor::new(b"abcd"), 3);
+        let mut output = Vec::new();
+        assert!(excessive.read_to_end(&mut output).is_err());
+    }
+
+    #[test]
+    fn gnu_long_names_and_local_pax_paths_remain_supported() {
+        let version = semver::Version::parse("1.2.3").unwrap();
+        let target = Target::X86_64UnknownLinuxGnu;
+        let root = target.root_name(&TEST_APP, &version);
+
+        let mut gnu = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut builder = Builder::new(&mut gnu);
+            append_test_root(&mut builder, &root);
+            let mut extra = tar::Header::new_gnu();
+            extra.set_size(0);
+            extra.set_mode(0o644);
+            extra.set_cksum();
+            let long_path = format!("{root}/{}", "long-name-".repeat(20));
+            builder
+                .append_data(&mut extra, long_path, Cursor::new(Vec::<u8>::new()))
+                .unwrap();
+            append_test_payload(&mut builder, &format!("{root}/hyprmux"));
+            builder.finish().unwrap();
+        }
+        let gnu = gnu.finish().unwrap();
+        let asset = unix_asset(&version, &gnu);
+        assert!(inspect_archive(&TEST_APP, &gnu, &asset).is_ok());
+
+        let pax_record = |key: &str, value: &str| {
+            let body = format!("{key}={value}\n");
+            let mut length = body.len() + 2;
+            loop {
+                let record = format!("{length} {body}");
+                if record.len() == length {
+                    break record;
+                }
+                length = record.len();
+            }
+        };
+        let global_metadata = format!(
+            "{}{}{}{}{}",
+            pax_record("path", "outside"),
+            pax_record("path", ""),
+            pax_record("size", "1"),
+            pax_record("size", ""),
+            pax_record("mtime", "0")
+        );
+        let mut global = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut builder = Builder::new(&mut global);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::XGlobalHeader);
+            header.set_size(global_metadata.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(
+                    &mut header,
+                    "GlobalHead",
+                    Cursor::new(global_metadata.as_bytes()),
+                )
+                .unwrap();
+            append_test_root(&mut builder, &root);
+            append_test_payload(&mut builder, &format!("{root}/hyprmux"));
+            builder.finish().unwrap();
+        }
+        let global = global.finish().unwrap();
+        let asset = unix_asset(&version, &global);
+        assert!(inspect_archive(&TEST_APP, &global, &asset).is_ok());
+
+        let metadata = format!(
+            "{}{}",
+            pax_record("path", &format!("{root}/hyprmux")),
+            pax_record("size", "3")
+        );
+        let mut raw = Vec::new();
+        {
+            let mut append_raw = |header: &tar::Header, data: &[u8]| {
+                raw.extend_from_slice(header.as_bytes());
+                raw.extend_from_slice(data);
+                raw.resize(raw.len() + (512 - data.len() % 512) % 512, 0);
+            };
+            let mut root_header = tar::Header::new_gnu();
+            root_header.set_path(&root).unwrap();
+            root_header.set_entry_type(tar::EntryType::Directory);
+            root_header.set_size(0);
+            root_header.set_mode(0o755);
+            root_header.set_cksum();
+            append_raw(&root_header, &[]);
+            let mut pax_header = tar::Header::new_gnu();
+            pax_header.set_path("PaxHeaders/entry").unwrap();
+            pax_header.set_entry_type(tar::EntryType::XHeader);
+            pax_header.set_size(metadata.len() as u64);
+            pax_header.set_mode(0o644);
+            pax_header.set_cksum();
+            append_raw(&pax_header, metadata.as_bytes());
+            let mut payload_header = tar::Header::new_gnu();
+            payload_header.set_path(format!("{root}/hyprmux")).unwrap();
+            payload_header.set_size(0);
+            payload_header.set_mode(0o755);
+            payload_header.set_cksum();
+            append_raw(&payload_header, b"bin");
+        }
+        raw.resize(raw.len() + 1024, 0);
+        let mut pax = GzEncoder::new(Vec::new(), Compression::default());
+        pax.write_all(&raw).unwrap();
+        let pax = pax.finish().unwrap();
+        let asset = unix_asset(&version, &pax);
+        assert!(inspect_archive(&TEST_APP, &pax, &asset).is_ok());
+    }
+
+    #[test]
+    fn tar_and_zip_member_counts_are_bounded() {
+        let version = semver::Version::parse("1.2.3").unwrap();
+        let unix_target = Target::X86_64UnknownLinuxGnu;
+        let unix_root = unix_target.root_name(&TEST_APP, &version);
+        let mut compressed = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut builder = Builder::new(&mut compressed);
+            for index in 0..=MAX_ARCHIVE_MEMBERS {
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(tar::EntryType::Directory);
+                header.set_size(0);
+                header.set_mode(0o755);
+                header.set_cksum();
+                builder
+                    .append_data(
+                        &mut header,
+                        format!("{unix_root}/empty-{index}/"),
+                        Cursor::new(Vec::<u8>::new()),
+                    )
+                    .unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        let tar = compressed.finish().unwrap();
+        let tar_asset = unix_asset(&version, &tar);
+        let error = inspect_archive(&TEST_APP, &tar, &tar_asset).unwrap_err();
+        assert!(error.to_string().contains("member count"));
+
+        let windows_target = Target::X86_64PcWindowsMsvc;
+        let windows_root = windows_target.root_name(&TEST_APP, &version);
+        let mut output = Cursor::new(Vec::new());
+        {
+            let mut writer = ZipWriter::new(&mut output);
+            let options =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            for index in 0..=MAX_ARCHIVE_MEMBERS {
+                writer
+                    .add_directory(format!("{windows_root}/empty-{index}/"), options)
+                    .unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        let zip = output.into_inner();
+        let zip_asset = ReleaseAsset::new(
+            &TEST_APP,
+            &version,
+            windows_target,
+            zip.len() as u64,
+            sha256_bytes(&zip),
+            3,
+            sha256_bytes(b"bin"),
+        )
+        .with_launcher(
+            &TEST_APP,
+            &version,
+            windows_target,
+            1,
+            3,
+            sha256_bytes(b"run"),
+        );
+        let error = inspect_archive(&TEST_APP, &zip, &zip_asset).unwrap_err();
+        assert!(error.to_string().contains("member count"));
+    }
+
+    #[test]
+    fn zip_central_directory_allocations_are_bounded_before_parsing() {
+        let version = semver::Version::parse("1.2.3").unwrap();
+        let target = Target::X86_64PcWindowsMsvc;
+        let root = target.root_name(&TEST_APP, &version);
+
+        let mut long_name_output = Cursor::new(Vec::new());
+        {
+            let mut writer = ZipWriter::new(&mut long_name_output);
+            let options =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            writer
+                .start_file(
+                    format!("{root}/{}", "n".repeat(MAX_ARCHIVE_MEMBER_NAME + 1)),
+                    options,
+                )
+                .unwrap();
+            writer.finish().unwrap();
+        }
+        let long_name = long_name_output.into_inner();
+        let asset = ReleaseAsset::new(
+            &TEST_APP,
+            &version,
+            target,
+            long_name.len() as u64,
+            sha256_bytes(&long_name),
+            3,
+            sha256_bytes(b"bin"),
+        )
+        .with_launcher(&TEST_APP, &version, target, 1, 3, sha256_bytes(b"run"));
+        let error = inspect_archive(&TEST_APP, &long_name, &asset).unwrap_err();
+        assert!(error.to_string().contains("member name"));
+
+        let mut metadata_output = Cursor::new(Vec::new());
+        {
+            let mut writer = ZipWriter::new(&mut metadata_output);
+            let options =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            for index in 0..2100 {
+                let prefix = format!("{root}/{index}-");
+                writer
+                    .start_file(
+                        format!("{prefix}{}", "m".repeat(4000 - prefix.len())),
+                        options,
+                    )
+                    .unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        let metadata = metadata_output.into_inner();
+        let asset = ReleaseAsset::new(
+            &TEST_APP,
+            &version,
+            target,
+            metadata.len() as u64,
+            sha256_bytes(&metadata),
+            3,
+            sha256_bytes(b"bin"),
+        )
+        .with_launcher(&TEST_APP, &version, target, 1, 3, sha256_bytes(b"run"));
+        let error = inspect_archive(&TEST_APP, &metadata, &asset).unwrap_err();
+        assert!(error.to_string().contains("central metadata"));
+    }
+
+    #[test]
+    fn extraction_never_replaces_an_existing_output() {
+        let version = semver::Version::parse("1.2.3").unwrap();
+        let root_name = Target::X86_64UnknownLinuxGnu.root_name(&TEST_APP, &version);
+        let archive = tar_archive(&version, &format!("{root_name}/hyprmux"), b"bin");
+        let asset = unix_asset(&version, &archive);
+        let destination =
+            std::env::temp_dir().join(format!("relswap-extract-existing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&destination);
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(destination.join("hyprmux"), b"original").unwrap();
+
+        assert!(extract_archive(&TEST_APP, &archive, &asset, &destination).is_err());
+        assert_eq!(
+            std::fs::read(destination.join("hyprmux")).unwrap(),
+            b"original"
+        );
+        let _ = std::fs::remove_dir_all(destination);
+    }
+
+    #[test]
+    fn extraction_rolls_back_payload_when_launcher_creation_fails() {
+        let version = semver::Version::parse("1.2.3").unwrap();
+        let target = Target::X86_64PcWindowsMsvc;
+        let root_name = target.root_name(&TEST_APP, &version);
+        let archive = zip_windows_archive(&root_name);
+        let asset = ReleaseAsset::new(
+            &TEST_APP,
+            &version,
+            target,
+            archive.len() as u64,
+            sha256_bytes(&archive),
+            3,
+            sha256_bytes(b"bin"),
+        )
+        .with_launcher(&TEST_APP, &version, target, 1, 3, sha256_bytes(b"run"));
+        let destination =
+            std::env::temp_dir().join(format!("relswap-extract-rollback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&destination);
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(destination.join("hyprmux-launcher.exe"), b"original").unwrap();
+
+        assert!(extract_archive(&TEST_APP, &archive, &asset, &destination).is_err());
+        assert!(!destination.join("hyprmux.exe").exists());
+        assert_eq!(
+            std::fs::read(destination.join("hyprmux-launcher.exe")).unwrap(),
+            b"original"
+        );
+        let _ = std::fs::remove_dir_all(destination);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extraction_rejects_symlink_destinations_ancestors_and_outputs() {
+        use std::os::unix::fs::symlink;
+
+        let version = semver::Version::parse("1.2.3").unwrap();
+        let root_name = Target::X86_64UnknownLinuxGnu.root_name(&TEST_APP, &version);
+        let archive = tar_archive(&version, &format!("{root_name}/hyprmux"), b"bin");
+        let asset = unix_asset(&version, &archive);
+        let root =
+            std::env::temp_dir().join(format!("relswap-extract-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::fs::create_dir_all(root.join("outside")).unwrap();
+
+        symlink(root.join("real"), root.join("destination-link")).unwrap();
+        assert!(
+            extract_archive(&TEST_APP, &archive, &asset, &root.join("destination-link")).is_err()
+        );
+        assert!(!root.join("real/hyprmux").exists());
+
+        symlink(root.join("outside"), root.join("ancestor-link")).unwrap();
+        assert!(
+            extract_archive(
+                &TEST_APP,
+                &archive,
+                &asset,
+                &root.join("ancestor-link/nested"),
+            )
+            .is_err()
+        );
+        assert!(!root.join("outside/nested/hyprmux").exists());
+
+        std::fs::write(root.join("victim"), b"original").unwrap();
+        symlink(root.join("victim"), root.join("real/hyprmux")).unwrap();
+        assert!(extract_archive(&TEST_APP, &archive, &asset, &root.join("real")).is_err());
+        assert_eq!(std::fs::read(root.join("victim")).unwrap(), b"original");
+
+        let archive_path = root.join("archive.tar.gz");
+        std::fs::write(&archive_path, &archive).unwrap();
+        symlink(&archive_path, root.join("archive-link.tar.gz")).unwrap();
+        assert!(verify_archive_file(&TEST_APP, &root.join("archive-link.tar.gz"), &asset).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn tar_traversal_symlink_and_duplicate_members_are_rejected() {
         let version = semver::Version::parse("1.2.3").unwrap();
         let root = Target::X86_64UnknownLinuxGnu.root_name(&TEST_APP, &version);
@@ -858,6 +1637,36 @@ mod tests {
         let complete_release = inspect_archive(&TEST_APP, &complete, &complete_asset).unwrap();
         assert_eq!(complete_release.payload.data, b"bin");
         assert_eq!(complete_release.launcher.unwrap().data, b"run");
+
+        let mut commented = Cursor::new(Vec::new());
+        {
+            let mut writer = ZipWriter::new(&mut commented);
+            let options =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            writer.set_comment("comment containing PK\u{5}\u{6} marker");
+            writer.add_directory(format!("{root}/"), options).unwrap();
+            writer
+                .start_file(format!("{root}/hyprmux.exe"), options)
+                .unwrap();
+            writer.write_all(b"bin").unwrap();
+            writer
+                .start_file(format!("{root}/hyprmux-launcher.exe"), options)
+                .unwrap();
+            writer.write_all(b"run").unwrap();
+            writer.finish().unwrap();
+        }
+        let commented = commented.into_inner();
+        let commented_asset = ReleaseAsset::new(
+            &TEST_APP,
+            &version,
+            target,
+            commented.len() as u64,
+            sha256_bytes(&commented),
+            3,
+            sha256_bytes(b"bin"),
+        )
+        .with_launcher(&TEST_APP, &version, target, 1, 3, sha256_bytes(b"run"));
+        assert!(inspect_archive(&TEST_APP, &commented, &commented_asset).is_ok());
 
         let payload = zip_archive(&format!("{root}/hyprmux.exe"), b"bin");
         let mut asset = ReleaseAsset::new(

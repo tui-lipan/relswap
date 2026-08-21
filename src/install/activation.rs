@@ -5,11 +5,210 @@ use super::*;
 use crate::release::{ReleaseMetadata, ReleaseTarget};
 use std::io::Read;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 /// Backoff between self-test spawn attempts rejected with `ETXTBSY`.
 const SELF_TEST_BUSY_RETRY_DELAY: Duration = Duration::from_millis(25);
+/// Combined stdout and stderr retained from a self-test.
+const SELF_TEST_OUTPUT_LIMIT: usize = 1024 * 1024;
+const SELF_TEST_READ_CHUNK: usize = 8 * 1024;
+const SELF_TEST_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+enum SelfTestOutput {
+    Data(usize, Vec<u8>),
+    Done(io::Result<()>),
+    LimitExceeded,
+}
+
+fn spawn_self_test_reader<R>(
+    mut reader: R,
+    stream: usize,
+    output_size: Arc<AtomicUsize>,
+    sender: mpsc::SyncSender<SelfTestOutput>,
+) where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let result = (|| {
+            let mut buffer = [0u8; SELF_TEST_READ_CHUNK];
+            loop {
+                let read = reader.read(&mut buffer)?;
+                if read == 0 {
+                    return Ok(());
+                }
+                let reserved =
+                    output_size.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                        current
+                            .checked_add(read)
+                            .filter(|total| *total <= SELF_TEST_OUTPUT_LIMIT)
+                    });
+                if reserved.is_err() {
+                    let _ = sender.send(SelfTestOutput::LimitExceeded);
+                    return Ok(());
+                }
+                if sender
+                    .send(SelfTestOutput::Data(stream, buffer[..read].to_vec()))
+                    .is_err()
+                {
+                    return Ok(());
+                }
+            }
+        })();
+        let _ = sender.send(SelfTestOutput::Done(result));
+    });
+}
+
+struct SelfTestProcessGroup {
+    #[cfg(windows)]
+    job: Option<windows_sys::Win32::Foundation::HANDLE>,
+}
+
+impl SelfTestProcessGroup {
+    fn attach(child: &std::process::Child) -> io::Result<Self> {
+        #[cfg(windows)]
+        {
+            use std::mem::{size_of, zeroed};
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::System::JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+                SetInformationJobObject,
+            };
+
+            let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if job.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            // Ownership starts immediately. Any setup return drops `group` and closes the handle.
+            let group = Self { job: Some(job) };
+            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let configured = unsafe {
+                SetInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformation,
+                    (&raw const limits).cast(),
+                    size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            };
+            if configured == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let assigned = unsafe { AssignProcessToJobObject(job, child.as_raw_handle() as _) };
+            if assigned == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(group)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = child;
+            Ok(Self {})
+        }
+    }
+
+    fn terminate(&self, child_id: u32) {
+        #[cfg(unix)]
+        unsafe {
+            // The child starts a new process group whose id is its pid.
+            libc::kill(-(child_id as libc::pid_t), libc::SIGKILL);
+        }
+        #[cfg(windows)]
+        if let Some(job) = self.job {
+            let _ = child_id;
+            unsafe {
+                windows_sys::Win32::System::JobObjects::TerminateJobObject(job, 1);
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        let _ = child_id;
+    }
+}
+
+fn resume_self_test(child: &std::process::Child) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::mem::{size_of, zeroed};
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+        };
+        use windows_sys::Win32::System::Threading::{
+            OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+        };
+
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let result = (|| {
+            let mut entry: THREADENTRY32 = unsafe { zeroed() };
+            entry.dwSize = size_of::<THREADENTRY32>() as u32;
+            if unsafe { Thread32First(snapshot, &raw mut entry) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            loop {
+                if entry.th32OwnerProcessID == child.id() {
+                    let thread =
+                        unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+                    if thread.is_null() {
+                        return Err(io::Error::last_os_error());
+                    }
+                    let resumed = unsafe { ResumeThread(thread) };
+                    unsafe {
+                        CloseHandle(thread);
+                    }
+                    if resumed == u32::MAX {
+                        return Err(io::Error::last_os_error());
+                    }
+                    return Ok(());
+                }
+                if unsafe { Thread32Next(snapshot, &raw mut entry) } == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "suspended self-test thread was not found",
+                    ));
+                }
+            }
+        })();
+        unsafe {
+            CloseHandle(snapshot);
+        }
+        result
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = child;
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SelfTestProcessGroup {
+    fn drop(&mut self) {
+        if let Some(job) = self.job {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(job);
+            }
+        }
+    }
+}
+
+fn terminate_self_test(
+    mut child: std::process::Child,
+    child_id: u32,
+    process_group: &SelfTestProcessGroup,
+) {
+    process_group.terminate(child_id);
+    let _ = child.kill();
+    // Reaping can wait on OS process teardown. Keep it out of the caller's timeout budget.
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
+}
 
 impl<D: Downloader> Installation<D> {
     /// Install the exact package version supplied by [`App::version`].
@@ -447,12 +646,25 @@ impl<D: Downloader> Installation<D> {
         // payload that cannot run, and a bare "self-test failed" would hide precisely the
         // ENOENT/EACCES/loader errors it was added to surface.
         let mut child = loop {
-            match Command::new(self.payload_path(version))
+            let mut command = Command::new(self.payload_path(version));
+            command
                 .args(config.args)
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
+                .stderr(Stdio::piped());
+            #[cfg(unix)]
             {
+                use std::os::unix::process::CommandExt;
+                // A separate process group lets timeout cleanup include descendants which inherited
+                // the output pipes. The direct child remains the only process whose status matters.
+                command.process_group(0);
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+                command.creation_flags(CREATE_SUSPENDED);
+            }
+            match command.spawn() {
                 Ok(child) => break child,
                 Err(error)
                     if error.kind() == io::ErrorKind::ExecutableFileBusy
@@ -467,55 +679,98 @@ impl<D: Downloader> Installation<D> {
                 }
             }
         };
-        let mut stdout = child
+        let process_group = match SelfTestProcessGroup::attach(&child) {
+            Ok(group) => group,
+            Err(error) => {
+                let child_id = child.id();
+                let _ = child.kill();
+                thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return Err(InstallError::Invalid(format!(
+                    "self-test process containment failed for child {child_id}: {error}"
+                )));
+            }
+        };
+        if let Err(error) = resume_self_test(&child) {
+            let child_id = child.id();
+            terminate_self_test(child, child_id, &process_group);
+            return Err(InstallError::Invalid(format!(
+                "could not resume contained self-test child {child_id}: {error}"
+            )));
+        }
+        let stdout = child
             .stdout
             .take()
             .ok_or_else(|| InstallError::Invalid("self-test failed".into()))?;
-        let mut stderr = child
+        let stderr = child
             .stderr
             .take()
             .ok_or_else(|| InstallError::Invalid("self-test failed".into()))?;
-        let stdout_reader = thread::spawn(move || {
-            let mut bytes = Vec::new();
-            stdout.read_to_end(&mut bytes).map(|_| bytes)
-        });
-        let stderr_reader = thread::spawn(move || {
-            let mut bytes = Vec::new();
-            stderr.read_to_end(&mut bytes).map(|_| bytes)
-        });
+        let child_id = child.id();
+        let output_size = Arc::new(AtomicUsize::new(0));
+        let (sender, receiver) = mpsc::sync_channel(16);
+        spawn_self_test_reader(stdout, 0, Arc::clone(&output_size), sender.clone());
+        spawn_self_test_reader(stderr, 1, output_size, sender);
+
         // `started` is deliberately not reset: `config.timeout` bounds the whole probe, spawn
         // retries included, so a payload that is busy for the full budget cannot also get a fresh
         // budget to run in.
-        let status = loop {
-            if let Some(status) = child
-                .try_wait()
-                .map_err(|_| InstallError::Invalid("self-test failed".into()))?
-            {
-                break status;
+        let mut status = None;
+        let mut readers_done = 0;
+        let mut output = [Vec::new(), Vec::new()];
+        while status.is_none() || readers_done < 2 {
+            if status.is_none() {
+                status = match child.try_wait() {
+                    Ok(status) => status,
+                    Err(error) => {
+                        terminate_self_test(child, child_id, &process_group);
+                        return Err(InstallError::Invalid(format!(
+                            "self-test status check failed: {error}"
+                        )));
+                    }
+                };
             }
             if started.elapsed() >= config.timeout {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
+                terminate_self_test(child, child_id, &process_group);
                 return Err(InstallError::Invalid("self-test timed out".into()));
             }
-            thread::sleep(std::time::Duration::from_millis(10));
-        };
-        let mut output = stdout_reader
-            .join()
-            .map_err(|_| InstallError::Invalid("self-test failed".into()))?
-            .map_err(|_| InstallError::Invalid("self-test failed".into()))?;
-        output.extend(
-            stderr_reader
-                .join()
-                .map_err(|_| InstallError::Invalid("self-test failed".into()))?
-                .map_err(|_| InstallError::Invalid("self-test failed".into()))?,
-        );
+            let wait = config
+                .timeout
+                .saturating_sub(started.elapsed())
+                .min(SELF_TEST_POLL_INTERVAL);
+            match receiver.recv_timeout(wait) {
+                Ok(SelfTestOutput::Data(stream, bytes)) => output[stream].extend(bytes),
+                Ok(SelfTestOutput::Done(Ok(()))) => readers_done += 1,
+                Ok(SelfTestOutput::Done(Err(error))) => {
+                    terminate_self_test(child, child_id, &process_group);
+                    return Err(InstallError::Invalid(format!(
+                        "self-test output read failed: {error}"
+                    )));
+                }
+                Ok(SelfTestOutput::LimitExceeded) => {
+                    terminate_self_test(child, child_id, &process_group);
+                    return Err(InstallError::Invalid(format!(
+                        "self-test output exceeds {SELF_TEST_OUTPUT_LIMIT} bytes"
+                    )));
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) if readers_done == 2 => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    terminate_self_test(child, child_id, &process_group);
+                    return Err(InstallError::Invalid(
+                        "self-test output readers stopped unexpectedly".into(),
+                    ));
+                }
+            }
+        }
+        let status = status.ok_or_else(|| InstallError::Invalid("self-test failed".into()))?;
         if !status.success() {
             return Err(InstallError::Invalid("self-test failed".into()));
         }
-        if !String::from_utf8_lossy(&output).contains(&version.to_string()) {
+        let [mut combined, stderr] = output;
+        combined.extend(stderr);
+        if !String::from_utf8_lossy(&combined).contains(&version.to_string()) {
             return Err(InstallError::Invalid("self-test output mismatch".into()));
         }
         Ok(())
@@ -1002,12 +1257,14 @@ impl<D: Downloader> Installation<D> {
         &self,
         launcher: &LauncherOwnership,
     ) -> Result<()> {
-        if !launcher.owned
-            || launcher.protocol != 1
-            || launcher.path != self.command_path.to_string_lossy()
-        {
+        if !launcher.owned || launcher.protocol != 1 {
             return Err(InstallError::Invalid(
                 "Windows launcher ownership/protocol metadata is invalid".into(),
+            ));
+        }
+        if !executable::same_regular_file_object(Path::new(&launcher.path), &self.command_path)? {
+            return Err(InstallError::Invalid(
+                "Windows launcher ownership path identifies a different file".into(),
             ));
         }
         executable::ensure_regular_file(&self.command_path)?;

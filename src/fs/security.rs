@@ -6,12 +6,10 @@
 //! enforced inline before this module existed.
 //!
 //! On Windows the equivalent is a directory created with an explicit, non-inherited DACL granting
-//! full control to the current user's SID and nobody else ([`private_security_descriptor`], shared
-//! with the named-pipe backend in [`super::ipc`] so an endpoint and the registry entry pointing at
-//! it are protected by exactly the same ACL). Validation of an existing directory additionally
-//! rejects a reparse point (junction/symlink) standing in for it, the Windows counterpart of the
-//! Unix `symlink_metadata` check - an attacker-planted junction is the mechanism that would
-//! otherwise redirect a private directory somewhere world-readable.
+//! full control to the current user's SID and nobody else. Validation of an existing directory
+//! also rejects a reparse point (junction/symlink) standing in for it, the Windows counterpart of
+//! the Unix `symlink_metadata` check. An attacker-planted junction could otherwise redirect a
+//! private directory somewhere world-readable.
 //!
 //! The Windows half type-checks under `cargo check --target x86_64-pc-windows-gnu` but is
 //! **unverified at runtime** - no Windows host is available in this workspace.
@@ -104,16 +102,19 @@ pub fn validate_private_dir(dir: &Path, metadata: &fs::Metadata) -> io::Result<(
 mod windows_impl {
     use super::{Path, fs, io};
 
-    use windows_sys::Win32::Foundation::{HANDLE, HLOCAL, LocalFree};
+    use windows_sys::Win32::Foundation::{GENERIC_ALL, HANDLE, HLOCAL, LocalFree};
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-        SDDL_REVISION_1,
+        ConvertStringSidToSidW, GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
     };
     use windows_sys::Win32::Security::{
-        GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
-        TokenUser,
+        ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, CONTAINER_INHERIT_ACE,
+        DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
+        GetSecurityDescriptorControl, GetTokenInformation, OBJECT_INHERIT_ACE,
+        OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
+        SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
-    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     /// An owned `SECURITY_DESCRIPTOR` allocated by `ConvertStringSecurityDescriptorToSecurityDescriptorW`.
@@ -190,7 +191,7 @@ mod windows_impl {
     /// objects and containers so files created inside a private directory stay private.
     pub fn private_security_descriptor() -> io::Result<PrivateSecurityDescriptor> {
         let sid = current_user_sid()?;
-        let sddl = format!("D:P(A;OICI;GA;;;{sid})");
+        let sddl = format!("O:{sid}D:P(A;OICI;GA;;;{sid})");
         let wide: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
         let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
         let ok = unsafe {
@@ -208,22 +209,13 @@ mod windows_impl {
     }
 
     pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
-        match fs::symlink_metadata(dir) {
-            Ok(metadata) => validate_private_dir(dir, &metadata),
+        match crate::fs::executable::open_directory_handle(dir) {
+            Ok(directory) => validate_private_dir_handle(&directory),
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                // Every ancestor must exist before the leaf can be created with our own DACL.
-                // Ancestors are `%LOCALAPPDATA%`-style directories the user already owns, so they
-                // are created with inherited ACLs; only the leaf carries the protected DACL.
-                if let Some(parent) = dir.parent() {
-                    fs::create_dir_all(parent)?;
-                }
                 let descriptor = private_security_descriptor()?;
-                let attributes = descriptor.attributes();
-                let wide = wide_path(dir);
-                if unsafe { CreateDirectoryW(wide.as_ptr(), &attributes) } == 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                validate_private_dir(dir, &fs::symlink_metadata(dir)?)
+                let directory =
+                    crate::fs::executable::create_private_directory_handle(dir, descriptor.0)?;
+                validate_private_dir_handle(&directory)
             }
             Err(err) => Err(err),
         }
@@ -233,54 +225,142 @@ mod windows_impl {
     ///
     /// Uses `create_new` so an existing path is never truncated through a re-resolved path race.
     pub fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
-        use std::io::Write;
-
-        if let Some(parent) = path.parent() {
-            ensure_private_dir(parent)?;
-        }
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)?;
-        file.write_all(bytes)?;
-        file.sync_all()
+        let parent = path.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "private file has no parent")
+        })?;
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "private filename must be Unicode",
+                )
+            })?;
+        let directory = crate::fs::executable::open_private_directory(parent)?;
+        directory.create_new_file(filename, bytes, None).map(drop)
     }
 
-    /// Reject anything that is not a real directory we can trust: a file, or a reparse point
-    /// (junction/symlink) that could silently redirect the "private" directory somewhere else.
-    ///
-    /// This is the Windows counterpart of the Unix symlink check, not of the Unix *permission*
-    /// check: a directory we created carries the protected DACL from [`private_security_descriptor`],
-    /// and one we did not create but which is a plain directory under the user's own
-    /// `%LOCALAPPDATA%` is already only reachable by that user. Auditing an inherited DACL ACE by
-    /// ACE would add a great deal of surface for very little: the attack this actually has to stop
-    /// is the planted junction.
-    fn validate_private_dir(dir: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+    /// Validate type, reparse attributes, and DACL through one non-following directory handle.
+    pub(crate) fn validate_private_dir_handle(directory: &fs::File) -> io::Result<()> {
         use std::os::windows::fs::MetadataExt;
+        use std::os::windows::io::AsRawHandle;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 
+        let metadata = directory.metadata()?;
         if !metadata.file_type().is_dir() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!("{} is not a directory", dir.display()),
+                "private path is not a directory",
             ));
         }
         if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!("{} is a reparse point, not a real directory", dir.display()),
+                "private directory handle refers to a reparse point",
+            ));
+        }
+        validate_private_dacl(directory.as_raw_handle() as HANDLE)
+    }
+
+    fn validate_private_dacl(directory: HANDLE) -> io::Result<()> {
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let status = unsafe {
+            GetSecurityInfo(
+                directory,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        let descriptor = PrivateSecurityDescriptor(descriptor);
+        let mut control = 0u16;
+        let mut revision = 0u32;
+        if unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if control & SE_DACL_PROTECTED == 0 || dacl.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "directory does not have a protected private DACL",
+            ));
+        }
+        let mut info = ACL_SIZE_INFORMATION {
+            AceCount: 0,
+            AclBytesInUse: 0,
+            AclBytesFree: 0,
+        };
+        if unsafe {
+            GetAclInformation(
+                dacl,
+                (&raw mut info).cast(),
+                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if info.AceCount != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "directory DACL grants access to more than one identity",
+            ));
+        }
+        let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+        if unsafe { GetAce(dacl, 0, &mut ace) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let ace = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+        let required_flags = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+        if ace.Header.AceType != 0
+            || u32::from(ace.Header.AceFlags) & required_flags != required_flags
+            || (ace.Mask & FILE_ALL_ACCESS != FILE_ALL_ACCESS
+                && ace.Mask & GENERIC_ALL != GENERIC_ALL)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "directory DACL is not a private full-control ACL",
+            ));
+        }
+
+        let sid_string = current_user_sid()?;
+        let sid_wide = sid_string
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut expected_sid: PSID = std::ptr::null_mut();
+        if unsafe { ConvertStringSidToSidW(sid_wide.as_ptr(), &mut expected_sid) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let actual_sid = (&raw const ace.SidStart).cast_mut().cast();
+        let ace_matches = unsafe { EqualSid(actual_sid, expected_sid) } != 0;
+        let owner_matches = !owner.is_null() && unsafe { EqualSid(owner, expected_sid) } != 0;
+        unsafe {
+            LocalFree(expected_sid);
+        }
+        if !ace_matches {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "directory DACL belongs to a different identity",
+            ));
+        }
+        if !owner_matches {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "directory is owned by a different identity",
             ));
         }
         Ok(())
-    }
-
-    /// A NUL-terminated wide-char path, the form every `*W` Win32 entry point wants.
-    pub fn wide_path(path: &Path) -> Vec<u16> {
-        use std::os::windows::ffi::OsStrExt;
-        path.as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect()
     }
 
     unsafe fn wide_to_string(ptr: *const u16) -> String {
@@ -301,6 +381,8 @@ mod windows_impl {
     }
 }
 
+#[cfg(windows)]
+pub(crate) use windows_impl::validate_private_dir_handle;
 #[cfg(windows)]
 pub use windows_impl::{
     current_user_sid, ensure_private_dir, private_security_descriptor, write_private_file,
