@@ -14,7 +14,6 @@ impl<D: Downloader> Installation<D> {
         if !lexists(&self.root)? {
             return Ok(false);
         }
-        fs_security::ensure_private_dir(&self.root)?;
         let has_install = lexists(&self.install_state_path())?;
         let has_pending = lexists(&self.pending_path())?;
         let has_pointer = self.pointer_path_exists()?;
@@ -25,6 +24,14 @@ impl<D: Downloader> Installation<D> {
         if !has_install && !has_pending && !has_pointer && !has_staging_recovery {
             return Ok(false);
         }
+        // Only after the root is known to hold managed state. A directory can exist at this path
+        // without this engine having created it - on Windows `%LOCALAPPDATA%\<app>` is an ordinary
+        // place for anything to put a folder, and one created by any other means carries the
+        // parent's inheritable ACEs rather than a protected `D:P` DACL. Enforcing privacy before
+        // establishing ownership turned such a folder into a hard failure for *every* command,
+        // including the install that would have created the real layout - and the check the caller
+        // is refused by is one about state the caller does not have.
+        fs_security::ensure_private_dir(&self.root)?;
         #[cfg(unix)]
         if has_pointer && !has_install && !has_pending {
             // A command symlink is also a perfectly ordinary unmanaged user command.  Only a

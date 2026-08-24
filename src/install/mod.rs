@@ -1608,6 +1608,38 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// A directory can sit at the managed root without this engine having put it there, and its
+    /// permissions are then whatever created it - not the private ones this engine establishes.
+    /// Recovery used to enforce privacy before deciding the root held managed state, so such a
+    /// directory failed *every* command, including the install that would have taken the path over.
+    #[cfg(unix)]
+    #[test]
+    fn a_foreign_directory_at_the_root_reads_as_unmanaged_rather_than_failing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let version = Version::parse("1.2.3").unwrap();
+        let root = test_temp_dir().join(format!("relswap-foreign-root-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        // Group- and world-readable: exactly what a directory not created by this engine looks
+        // like, and what `ensure_private_dir` rejects.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let manager = fixture_manager(&version, &root, NoFaultInjector);
+        assert!(
+            !manager
+                .recover_if_managed()
+                .expect("a foreign directory is an unmanaged state, not an error"),
+            "a root with no managed state must report unmanaged"
+        );
+        assert_eq!(
+            fs::symlink_metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "an unmanaged root must be left exactly as it was found"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn initial_install_refuses_an_existing_unmanaged_command_without_creating_root_state() {

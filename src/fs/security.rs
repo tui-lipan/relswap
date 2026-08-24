@@ -210,7 +210,20 @@ mod windows_impl {
 
     pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
         match crate::fs::executable::open_directory_handle(dir) {
-            Ok(directory) => validate_private_dir_handle(&directory),
+            // Name the directory in the failure. A bare "does not have a protected private DACL"
+            // describes a Windows ACL invariant most people have no reason to know, says nothing
+            // about which path is at fault, and gives no way forward - while the fix is usually
+            // just removing a folder something else left at the managed path.
+            Ok(directory) => validate_private_dir_handle(&directory).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "{}: {error}. This directory was not created by the managed installer; \
+                         remove it and run the install again.",
+                        dir.display()
+                    ),
+                )
+            }),
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 let descriptor = private_security_descriptor()?;
                 let directory =
