@@ -840,6 +840,22 @@ mod windows_handle {
     }
 
     pub(super) fn open_directory(path: &Path, create: bool) -> io::Result<File> {
+        open_directory_with_descriptor(path, create, std::ptr::null_mut())
+    }
+
+    /// Walk `path`, optionally creating missing components.
+    ///
+    /// `security_descriptor` applies to components this call *creates*; Windows ignores it when
+    /// `FILE_OPEN_IF` opens an object that already exists, so directories already on disk keep the
+    /// permissions they have. That distinction is the point: creating an ancestor with the default
+    /// inheritable ACEs, on the way to creating a private leaf, left the engine having built a
+    /// directory its own privacy check would later reject - and on Windows the managed root is
+    /// exactly such an ancestor the first time anything else under it is created.
+    pub(super) fn open_directory_with_descriptor(
+        path: &Path,
+        create: bool,
+        security_descriptor: *mut core::ffi::c_void,
+    ) -> io::Result<File> {
         let path = absolute_normalized(path)?;
         let (root, components) = split_root(&path)?;
         let mut directory = open_root(&root, SHARE_ALL)?;
@@ -851,7 +867,7 @@ mod windows_handle {
                 SHARE_ALL,
                 if create { FILE_OPEN_IF } else { FILE_OPEN },
                 FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
-                std::ptr::null_mut(),
+                security_descriptor,
             )?;
             validate_directory(&directory)?;
         }
@@ -872,7 +888,11 @@ mod windows_handle {
                 "directory path has no basename",
             )
         })?;
-        let parent = open_directory(parent, true)?;
+        // Missing ancestors are created with the same protected descriptor as the leaf. Without it
+        // the parent chain lands with the inheritable ACEs of whatever contains it, which is how
+        // `%LOCALAPPDATA%\<app>` ended up unprotected the first time an app created a private
+        // directory *inside* it.
+        let parent = open_directory_with_descriptor(parent, true, security_descriptor)?;
         let directory = open_relative(
             &parent,
             filename,
