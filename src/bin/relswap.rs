@@ -1060,7 +1060,12 @@ mod tests {
         };
         let version = "1.2.3";
         let stem = format!("demo-{version}-x86_64-pc-windows-msvc");
-        let dir = env::temp_dir().join(format!("relswap-zip-mode-{}", std::process::id()));
+        // Canonical: macOS hands out `/var/folders/...`, a symlink to `/private/var/folders/...`,
+        // and the archive inspection resolves paths before comparing them.
+        let dir = env::temp_dir()
+            .canonicalize()
+            .expect("canonical temporary directory")
+            .join(format!("relswap-zip-mode-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("{stem}.zip"));
