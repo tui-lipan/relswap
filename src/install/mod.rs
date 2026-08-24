@@ -513,17 +513,13 @@ impl<D: Downloader> Installation<D> {
                 "Windows launcher parent is not the managed bin directory".into(),
             ));
         }
-        let launcher_name = self.app.launcher_name().ok_or_else(|| {
-            InstallError::Invalid("Windows installations require launcher activation".into())
-        })?;
-        if executable::directory_is_case_sensitive(parent)?
-            && self.command_path.file_name() != Some(std::ffi::OsStr::new(launcher_name))
-        {
-            return Err(InstallError::Invalid(
-                "Windows launcher filename casing is noncanonical in a case-sensitive directory"
-                    .into(),
-            ));
-        }
+        // Deliberately no filename comparison here. This used to require the command's basename to
+        // equal `launcher_name`, which is the published archive filename rather than the installed
+        // command name; against a command legitimately named `<app>.exe` it could only ever fail.
+        // Casing has nothing to compare against either: the command path is the caller's own
+        // configured value and the launcher is written to exactly that path, so there is no second
+        // spelling for it to disagree with. The property that matters - that the parent really is
+        // the managed `bin/` directory and not a link aimed elsewhere - is the check above.
         Ok(())
     }
 
@@ -681,12 +677,41 @@ fn validate_command_path(
                 "Windows launcher name must be a plain basename".into(),
             ));
         }
-        let expected = root.join("bin").join(launcher_name);
-        if !same_path(command_path, &expected) {
+        // `launcher_name` is the *published* filename - the archive carries the launcher beside the
+        // payload, so the two need distinct names there (`app-launcher.exe` next to `app.exe`).
+        // The installed command is a different thing: it is what a user types, and once the two
+        // files live in different directories (`bin/` and `versions/<v>/`) there is no reason for
+        // it to carry the launcher's disambiguating suffix. Requiring the command path to equal
+        // `bin/<launcher_name>` forced every Windows consumer to expose `app-launcher.exe` as its
+        // user-facing command.
+        //
+        // The boundary worth enforcing is the directory, not the filename: the command must sit
+        // directly inside the managed `bin/`, so it cannot be aimed anywhere else on the system.
+        // `ensure_command_parent` re-checks the same property against the real directory object at
+        // install time; this is the configuration-time half.
+        let expected_parent = root.join("bin");
+        let parent = command_path.parent().ok_or_else(|| {
+            InstallError::Invalid(format!(
+                "managed command has no parent directory: {}",
+                command_path.display()
+            ))
+        })?;
+        if !same_path(parent, &expected_parent) {
             return Err(InstallError::Invalid(format!(
-                "Windows launcher path must be exactly {}",
-                expected.display()
+                "Windows command path must be directly inside {}",
+                expected_parent.display()
             )));
+        }
+        let command_name = command_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                InstallError::Invalid("Windows command path has no filename".to_string())
+            })?;
+        if !executable::is_safe_basename(command_name, true) {
+            return Err(InstallError::Invalid(
+                "Windows command name must be a plain basename".into(),
+            ));
         }
     }
     Ok(())
@@ -1032,15 +1057,24 @@ mod tests {
     }
 
     #[test]
-    fn launcher_path_validation_requires_the_exact_root_bin_child() {
+    fn launcher_path_validation_requires_a_direct_root_bin_child() {
         let root = Path::new("/managed/relswap");
         let expected = root.join("bin/hyprmux-launcher.exe");
         assert!(validate_command_path(root, &expected, Some("hyprmux-launcher.exe")).is_ok());
+        // The installed command carries the product's own name, not the published launcher
+        // filename. Rejecting this forced every Windows consumer to ship `app-launcher.exe` as the
+        // command its users type.
+        for command in [root.join("bin/hyprmux.exe"), root.join("bin/other.exe")] {
+            assert!(
+                validate_command_path(root, &command, Some("hyprmux-launcher.exe")).is_ok(),
+                "{}",
+                command.display()
+            );
+        }
         for command in [
             root.join("hyprmux-launcher.exe"),
             root.join("other/hyprmux-launcher.exe"),
             root.join("bin/nested/hyprmux-launcher.exe"),
-            root.join("bin/other.exe"),
             root.join("bin/../active"),
         ] {
             let command = lexical_normalize(&command);
@@ -1492,7 +1526,7 @@ mod tests {
             NoFaultInjector,
         );
         let error = manager.recover().unwrap_err();
-        assert!(error.to_string().contains("must be exactly"));
+        assert!(error.to_string().contains("must be directly inside"));
         assert!(!root.exists());
     }
 

@@ -306,12 +306,6 @@ pub(crate) fn same_regular_file_object(left: &Path, right: &Path) -> io::Result<
     windows_handle::same_object(&left.file, &right.file)
 }
 
-#[cfg(windows)]
-pub(crate) fn directory_is_case_sensitive(path: &Path) -> io::Result<bool> {
-    let directory = windows_handle::open_directory(path, false)?;
-    windows_handle::directory_is_case_sensitive(&directory)
-}
-
 pub(crate) struct OpenDirectory {
     handle: File,
     path: PathBuf,
