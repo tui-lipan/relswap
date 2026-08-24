@@ -654,14 +654,17 @@ fn inspect_zip(path: &Path, root: &str, payload: &str, launcher: &str) -> Result
         if member == root {
             return Err(format!("archive root {root} is not a directory"));
         }
-        if let Some(mode) = entry.unix_mode() {
-            if mode & 0o170000 == 0o120000 {
-                return Err(format!("archive contains symlink member {member}"));
-            }
-            if (member == payload || member == launcher) && mode & 0o111 == 0 {
-                return Err(format!("archive member {member} is not executable"));
-            }
+        if let Some(mode) = entry.unix_mode()
+            && mode & 0o170000 == 0o120000
+        {
+            return Err(format!("archive contains symlink member {member}"));
         }
+        // Deliberately no executable-bit requirement here, unlike the tar path above. ZIP is the
+        // Windows archive format, Windows has no Unix permission bits, and executability there
+        // comes from the `.exe` extension. A ZIP written on Windows reports its host system as DOS,
+        // for which `unix_mode()` synthesizes a mode out of the read-only attribute - never with
+        // `0o111` set - so requiring it rejected every Windows archive that could ever be built.
+        // The engine's own ZIP verification agrees: it checks member *type*, not permissions.
         let digest = hash_reader(&mut entry)?;
         if member == payload {
             payload_digest = Some(digest);
@@ -1035,6 +1038,51 @@ mod tests {
         let error = inspect_archive(&app, path, "1.2.3")
             .expect_err("missing archive should still be rejected by name");
         assert!(error.contains("wrong format") || error.contains("open"));
+    }
+
+    /// A Windows ZIP has no Unix permission bits to carry, so requiring an executable one rejected
+    /// every Windows archive the release workflow could produce - the payload and launcher had just
+    /// been built and packaged correctly, and `manifest` refused them.
+    #[test]
+    fn windows_zip_members_do_not_need_a_unix_executable_bit() {
+        use zip::write::{SimpleFileOptions, ZipWriter};
+
+        let app = App {
+            name: "demo",
+            version: "0.0.0",
+            repository_url: "https://example.invalid/",
+            trust_anchor: EMPTY_TRUST_ANCHOR,
+            activation: ActivationStrategy::WindowsLauncher {
+                launcher_name: "demo-launcher.exe",
+                protocol: 1,
+            },
+            self_test: None,
+        };
+        let version = "1.2.3";
+        let stem = format!("demo-{version}-x86_64-pc-windows-msvc");
+        let dir = env::temp_dir().join(format!("relswap-zip-mode-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{stem}.zip"));
+
+        // 0o644 stands in for what a ZIP written on Windows reports: a readable, writable, plainly
+        // non-executable mode. The old check tested exactly this against 0o111 and failed.
+        let options = SimpleFileOptions::default().unix_permissions(0o644);
+        let mut writer = ZipWriter::new(File::create(&path).unwrap());
+        writer.add_directory(format!("{stem}/"), options).unwrap();
+        writer
+            .start_file(format!("{stem}/demo.exe"), options)
+            .unwrap();
+        writer.write_all(b"payload").unwrap();
+        writer
+            .start_file(format!("{stem}/demo-launcher.exe"), options)
+            .unwrap();
+        writer.write_all(b"launcher").unwrap();
+        writer.finish().unwrap();
+
+        inspect_archive(&app, &path, version)
+            .expect("a Windows ZIP carries no executable bit to require");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
