@@ -12,6 +12,7 @@ use chrono::Utc;
 use std::collections::BTreeSet;
 use std::time::Duration;
 use ureq::ResponseExt;
+use ureq::tls::{RootCerts, TlsConfig};
 use url::Url;
 
 pub const MAX_REDIRECTS: u32 = 8;
@@ -57,19 +58,47 @@ pub struct UreqDownloader {
 
 impl UreqDownloader {
     pub fn new() -> Self {
-        let config = ureq::Agent::config_builder()
-            .https_only(true)
-            .max_redirects(MAX_REDIRECTS)
-            .max_redirects_will_error(true)
-            .save_redirect_history(true)
-            .timeout_global(Some(REQUEST_TIMEOUT))
-            .timeout_connect(Some(REQUEST_TIMEOUT))
-            .timeout_recv_response(Some(REQUEST_TIMEOUT))
-            .timeout_recv_body(Some(REQUEST_TIMEOUT))
-            .build();
         Self {
-            agent: ureq::Agent::new_with_config(config),
+            agent: ureq::Agent::new_with_config(production_config()),
         }
+    }
+}
+
+fn production_config() -> ureq::config::Config {
+    ureq::Agent::config_builder()
+        // The bootstrap scripts and package managers use the host trust store. The managed
+        // downloader must agree with them so a machine with an administrator-installed CA
+        // (for example a corporate HTTPS inspection root) does not bootstrap successfully
+        // and then fail while fetching the signed manifest. Signature verification remains
+        // an independent requirement after TLS succeeds.
+        .tls_config(
+            TlsConfig::builder()
+                .root_certs(RootCerts::PlatformVerifier)
+                .build(),
+        )
+        .https_only(true)
+        .max_redirects(MAX_REDIRECTS)
+        .max_redirects_will_error(true)
+        .save_redirect_history(true)
+        .timeout_global(Some(REQUEST_TIMEOUT))
+        .timeout_connect(Some(REQUEST_TIMEOUT))
+        .timeout_recv_response(Some(REQUEST_TIMEOUT))
+        .timeout_recv_body(Some(REQUEST_TIMEOUT))
+        .build()
+}
+
+#[cfg(test)]
+mod production_tls_tests {
+    use super::*;
+
+    #[test]
+    fn production_downloads_use_the_platform_certificate_verifier() {
+        let config = production_config();
+
+        assert!(matches!(
+            config.tls_config().root_certs(),
+            RootCerts::PlatformVerifier
+        ));
     }
 }
 
