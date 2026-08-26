@@ -4,6 +4,9 @@ on:
   push:
     tags:
       - "v*"
+  # A dispatched run passes through `Verify release ref` like any other, so it only proceeds from
+  # a tag whose name matches the manifest version - it cannot publish from a branch.
+  workflow_dispatch:
 
 concurrency:
   group: release-${{ github.ref }}
