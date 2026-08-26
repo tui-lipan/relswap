@@ -58,6 +58,13 @@ jobs:
   github_release:
     name: create GitHub release
     needs: publish
+    # A dispatched run reaches this job with `publish` already failed, because the version it would
+    # upload is by definition one crates.io has: that is what makes the "release exists" branch
+    # below testable without a real release. A pushed tag still requires the upload to have
+    # succeeded, so a page never advertises a version the registry does not have.
+    if: >-
+      ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v')
+      && (needs.publish.result == 'success' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
