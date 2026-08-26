@@ -10,6 +10,8 @@ use super::{MAX_ARCHIVE_SIZE, MAX_METADATA_SIZE, ReleaseError, Result};
 use crate::App;
 use chrono::Utc;
 use std::collections::BTreeSet;
+use std::io::Read;
+use std::sync::Arc;
 use std::time::Duration;
 use ureq::ResponseExt;
 use ureq::tls::{RootCerts, TlsConfig};
@@ -46,20 +48,62 @@ impl DownloadResponse {
 }
 
 /// Injectable network boundary used by metadata and archive operations.
+///
+/// Deliberately free of progress plumbing: this is the seam tests inject a fake through, and a
+/// fake has no transfer to report on. Progress belongs to the real transport, so it lives on
+/// [`UreqDownloader`] instead - which also means an [`Installation`] gains a meter by being handed
+/// a differently configured downloader, not by growing a parameter.
+///
+/// [`Installation`]: crate::Installation
 pub trait Downloader {
     fn fetch(&self, url: &Url, max_bytes: usize) -> Result<DownloadResponse>;
 }
+
+/// Notified as a response body arrives.
+///
+/// `total` is the `Content-Length` when the server sent one. A chunked response has none, so an
+/// observer must be able to represent an unknown total rather than assuming a fraction exists.
+///
+/// Called once with `downloaded == 0` before any body is read, so an observer can show a started
+/// transfer rather than appearing only once the first chunk lands on a slow link. Implementations
+/// are called from the thread driving the download and should return promptly; throttle redraws in
+/// the observer rather than slowing the transfer.
+pub trait ProgressObserver: Send + Sync {
+    fn advance(&self, downloaded: u64, total: Option<u64>);
+}
+
+/// How much body to accumulate between observer calls.
+///
+/// Small enough that a slow link still animates, large enough that a fast one does not spend its
+/// time in the observer: at 64 KiB an 18 MB archive reports about 290 times.
+const PROGRESS_CHUNK: usize = 64 * 1024;
 
 /// A configured ureq/rustls downloader for production operations.
 #[derive(Clone)]
 pub struct UreqDownloader {
     agent: ureq::Agent,
+    /// Notified as bodies arrive. `None` reads the body in one call, exactly as before.
+    observer: Option<Arc<dyn ProgressObserver>>,
 }
 
 impl UreqDownloader {
     pub fn new() -> Self {
         Self {
             agent: ureq::Agent::new_with_config(production_config()),
+            observer: None,
+        }
+    }
+
+    /// A downloader that reports body progress to `observer`.
+    ///
+    /// The transport is otherwise identical, which is the point: a consumer that wants a progress
+    /// meter should not have to reimplement `Downloader` and with it this module's TLS, redirect,
+    /// and timeout policy. Getting `RootCerts::PlatformVerifier` wrong in a reimplementation is
+    /// what made every managed install fail with `UnknownIssuer` in rozi 0.0.3.
+    pub fn with_progress(observer: Arc<dyn ProgressObserver>) -> Self {
+        Self {
+            observer: Some(observer),
+            ..Self::new()
         }
     }
 }
@@ -85,6 +129,128 @@ fn production_config() -> ureq::config::Config {
         .timeout_recv_response(Some(REQUEST_TIMEOUT))
         .timeout_recv_body(Some(REQUEST_TIMEOUT))
         .build()
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<(u64, Option<u64>)>>);
+
+    impl ProgressObserver for Recorder {
+        fn advance(&self, downloaded: u64, total: Option<u64>) {
+            self.0
+                .lock()
+                .expect("recorder lock")
+                .push((downloaded, total));
+        }
+    }
+
+    /// Drive the chunked reader over an in-memory body, which is what a `Body` wraps anyway.
+    fn read_observed(
+        payload: &[u8],
+        max_bytes: usize,
+        observer: &dyn ProgressObserver,
+    ) -> Result<Vec<u8>> {
+        let total = Some(payload.len() as u64);
+        let mut body = ureq::Body::builder()
+            .limit(progress_read_limit(max_bytes).expect("limit"))
+            .reader(std::io::Cursor::new(payload.to_vec()));
+        read_response_body_observed(max_bytes, &mut body, total, observer)
+    }
+
+    #[test]
+    fn a_body_is_delivered_intact_and_reported_from_zero() {
+        let payload = vec![7u8; PROGRESS_CHUNK * 2 + 11];
+        let recorder = Recorder::default();
+        let bytes = read_observed(&payload, payload.len(), &recorder).expect("read");
+        assert_eq!(bytes, payload, "streaming must not alter the body");
+
+        let seen = recorder.0.lock().expect("lock");
+        // The leading zero is what lets a meter appear before the first chunk lands on a slow link.
+        assert_eq!(seen.first(), Some(&(0, Some(payload.len() as u64))));
+        assert_eq!(
+            seen.last(),
+            Some(&(payload.len() as u64, Some(payload.len() as u64)))
+        );
+        assert!(
+            seen.len() > 2,
+            "a multi-chunk body reports more than its endpoints"
+        );
+        // Progress only ever moves forward, which a meter relies on.
+        assert!(seen.windows(2).all(|pair| pair[0].0 <= pair[1].0));
+    }
+
+    #[test]
+    fn an_oversized_body_is_refused_rather_than_truncated() {
+        // The ceiling is the reason this path reads one byte past `max_bytes`. Truncating instead
+        // would surface later as a checksum failure and name the wrong cause.
+        //
+        // Which of the two guards fires is an implementation detail: the reader's own limit trips
+        // first and reports "larger than request limit", and the explicit length check behind it
+        // catches anything that limit ever stopped enforcing. What must hold is that the body is
+        // refused, and refused the same way the unobserved path refuses it.
+        let payload = vec![0u8; 4096];
+        let recorder = Recorder::default();
+        let observed = read_observed(&payload, 1024, &recorder).expect_err("must refuse");
+
+        let plain = read_response_body(1024, |limit| {
+            ureq::Body::builder()
+                .limit(limit)
+                .reader(std::io::Cursor::new(payload.clone()))
+                .with_config()
+                .limit(limit)
+                .read_to_vec()
+        })
+        .expect_err("the unobserved path must refuse it too");
+        assert_eq!(observed.to_string(), plain.to_string());
+    }
+
+    #[test]
+    fn a_body_exactly_at_the_ceiling_is_accepted() {
+        let payload = vec![3u8; 2048];
+        let recorder = Recorder::default();
+        let bytes = read_observed(&payload, 2048, &recorder).expect("exactly at the limit is fine");
+        assert_eq!(bytes.len(), 2048);
+    }
+
+    #[test]
+    fn an_empty_body_still_reports_its_start() {
+        let recorder = Recorder::default();
+        let bytes = read_observed(&[], 1024, &recorder).expect("read");
+        assert!(bytes.is_empty());
+        assert_eq!(recorder.0.lock().expect("lock").as_slice(), &[(0, Some(0))]);
+    }
+
+    #[test]
+    fn the_observed_and_unobserved_paths_share_one_ceiling() {
+        // Both readers must reject the same bodies; a divergence here would mean the progress
+        // downloader quietly accepted archives the plain one refuses.
+        assert_eq!(progress_read_limit(1024).expect("limit"), 1025);
+        assert!(progress_read_limit(usize::MAX).is_err());
+    }
+
+    #[test]
+    fn a_downloader_without_an_observer_is_the_default() {
+        assert!(UreqDownloader::new().observer.is_none());
+        let observer: Arc<dyn ProgressObserver> = Arc::new(Recorder::default());
+        assert!(UreqDownloader::with_progress(observer).observer.is_some());
+    }
+
+    #[test]
+    fn a_progress_downloader_keeps_the_production_transport() {
+        // The whole reason `with_progress` exists rather than consumers reimplementing
+        // `Downloader`: reimplementing it is how the platform verifier gets dropped by accident.
+        let observer: Arc<dyn ProgressObserver> = Arc::new(Recorder::default());
+        let downloader = UreqDownloader::with_progress(observer);
+        assert!(matches!(
+            downloader.agent.config().tls_config().root_certs(),
+            RootCerts::PlatformVerifier
+        ));
+        assert!(downloader.agent.config().https_only());
+    }
 }
 
 #[cfg(test)]
@@ -130,9 +296,14 @@ impl Downloader for UreqDownloader {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let bytes = read_response_body(max_bytes, |limit| {
-            response.body_mut().with_config().limit(limit).read_to_vec()
-        })?;
+        let body = response.body_mut();
+        let total = body.content_length();
+        let bytes = match self.observer.as_deref() {
+            None => read_response_body(max_bytes, |limit| {
+                body.with_config().limit(limit).read_to_vec()
+            })?,
+            Some(observer) => read_response_body_observed(max_bytes, body, total, observer)?,
+        };
         Ok(DownloadResponse::new(
             url.clone(),
             final_url,
@@ -142,16 +313,63 @@ impl Downloader for UreqDownloader {
     }
 }
 
+/// Read a body in chunks, notifying `observer` as it arrives.
+///
+/// Enforces the same ceiling as [`read_response_body`] by the same means - reading one byte past it
+/// so an oversized body is caught rather than silently truncated to exactly the limit, which would
+/// surface later as a checksum failure and name the wrong cause.
+fn read_response_body_observed(
+    max_bytes: usize,
+    body: &mut ureq::Body,
+    total: Option<u64>,
+    observer: &dyn ProgressObserver,
+) -> Result<Vec<u8>> {
+    let read_limit = progress_read_limit(max_bytes)?;
+    let mut reader = body.with_config().limit(read_limit).reader();
+    // Trust the declared length only as far as the ceiling: a server claiming gigabytes must not
+    // get them preallocated on the strength of a header.
+    let mut bytes = Vec::with_capacity(
+        total
+            .and_then(|total| usize::try_from(total).ok())
+            .unwrap_or(PROGRESS_CHUNK)
+            .min(max_bytes),
+    );
+    let mut chunk = vec![0u8; PROGRESS_CHUNK];
+
+    observer.advance(0, total);
+    loop {
+        let read = reader
+            .read(&mut chunk)
+            .map_err(|error| ReleaseError::download(error.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        observer.advance(bytes.len() as u64, total);
+    }
+
+    if bytes.len() > max_bytes {
+        return Err(ReleaseError::download(format!(
+            "response body exceeds maximum size {max_bytes}"
+        )));
+    }
+    Ok(bytes)
+}
+
+/// The read ceiling shared by both body readers: one byte past `max_bytes`, as a `u64`.
+fn progress_read_limit(max_bytes: usize) -> Result<u64> {
+    let read_limit = max_bytes
+        .checked_add(1)
+        .ok_or_else(|| ReleaseError::download("download size limit overflow"))?;
+    u64::try_from(read_limit).map_err(|_| ReleaseError::download("download size limit exceeds u64"))
+}
+
 fn read_response_body<F, E>(max_bytes: usize, read: F) -> Result<Vec<u8>>
 where
     F: FnOnce(u64) -> std::result::Result<Vec<u8>, E>,
     E: std::fmt::Display,
 {
-    let read_limit = max_bytes
-        .checked_add(1)
-        .ok_or_else(|| ReleaseError::download("download size limit overflow"))?;
-    let read_limit = u64::try_from(read_limit)
-        .map_err(|_| ReleaseError::download("download size limit exceeds u64"))?;
+    let read_limit = progress_read_limit(max_bytes)?;
     let bytes = read(read_limit).map_err(|error| ReleaseError::download(error.to_string()))?;
     if bytes.len() > max_bytes {
         return Err(ReleaseError::download(format!(

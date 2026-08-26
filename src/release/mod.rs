@@ -16,9 +16,9 @@ pub use archive::{
     verify_archive_file,
 };
 pub use download::{
-    DownloadResponse, DownloadedArchive, Downloader, ReleaseMetadata, UreqDownloader,
-    download_archive, fetch_exact_metadata, fetch_latest_metadata, fetch_latest_metadata_with_keys,
-    fetch_version_metadata_with_keys,
+    DownloadResponse, DownloadedArchive, Downloader, ProgressObserver, ReleaseMetadata,
+    UreqDownloader, download_archive, fetch_exact_metadata, fetch_latest_metadata,
+    fetch_latest_metadata_with_keys, fetch_version_metadata_with_keys,
 };
 pub use manifest::{
     Asset, FileDigest, LauncherInfo, Manifest, PayloadInfo, ReleaseAsset, ReleaseManifest,
