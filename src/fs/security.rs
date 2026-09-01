@@ -491,8 +491,8 @@ mod tests {
 }
 
 /// Cross-platform because the guarantee is: whoever loses the create still gets a validated
-/// directory back. Unix has always held it - `create_dir_all` accepts an existing directory - and
-/// Windows now does too.
+/// directory back, and neither platform held it for free. The two failures look nothing alike,
+/// which is the argument for one test over a per-platform pair.
 #[cfg(test)]
 mod concurrent_tests {
     use super::*;
@@ -503,11 +503,14 @@ mod concurrent_tests {
     /// exist yet every thread takes the create branch. On Windows that create is a `FILE_CREATE`,
     /// which reports `ERROR_ALREADY_EXISTS` rather than accepting the directory the winner just
     /// made; the losers used to propagate that as a hard failure, so a caller's first use of a
-    /// managed directory could fail for no reason but timing.
+    /// managed directory could fail for no reason but timing. Unix took the create branch happily -
+    /// `create_dir_all` accepts a directory that is already there - but created it under the umask
+    /// and tightened it to 0700 afterwards, so a thread validating during that window saw a
+    /// group-readable directory and rejected it.
     ///
     /// A race, so it is a stress test rather than a proof: threads that happen to serialise still
-    /// pass. It cannot fail spuriously, and with the create branch unguarded it failed on every
-    /// one of 20 Windows runs.
+    /// pass. It cannot fail spuriously, and it caught both bugs on first contact: every one of 20
+    /// Windows runs, and macOS CI.
     #[test]
     fn losing_the_create_race_still_yields_a_validated_directory() {
         let dir = std::env::temp_dir().join(format!(
