@@ -210,28 +210,47 @@ mod windows_impl {
 
     pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
         match crate::fs::executable::open_directory_handle(dir) {
-            // Name the directory in the failure. A bare "does not have a protected private DACL"
-            // describes a Windows ACL invariant most people have no reason to know, says nothing
-            // about which path is at fault, and gives no way forward - while the fix is usually
-            // just removing a folder something else left at the managed path.
-            Ok(directory) => validate_private_dir_handle(&directory).map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!(
-                        "{}: {error}. This directory was not created by the managed installer; \
-                         remove it and run the install again.",
-                        dir.display()
-                    ),
-                )
-            }),
+            Ok(directory) => validate_found_dir(dir, &directory),
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 let descriptor = private_security_descriptor()?;
-                let directory =
-                    crate::fs::executable::create_private_directory_handle(dir, descriptor.0)?;
-                validate_private_dir_handle(&directory)
+                match crate::fs::executable::create_private_directory_handle(dir, descriptor.0) {
+                    Ok(directory) => validate_private_dir_handle(&directory),
+                    // Someone else created the directory between the open above and this create.
+                    // The leaf is created with `FILE_CREATE` rather than `FILE_OPEN_IF` on purpose
+                    // - the descriptor only applies on create, so opening-if-exists would silently
+                    // adopt whatever DACL a directory already at the path happens to carry - which
+                    // means a lost race surfaces as `ERROR_ALREADY_EXISTS` instead of the
+                    // now-existing directory. Adopt the winner's directory the only way that keeps
+                    // the guarantee: re-open it and put it through the same validation any
+                    // pre-existing directory gets.
+                    Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                        let directory = crate::fs::executable::open_directory_handle(dir)?;
+                        validate_found_dir(dir, &directory)
+                    }
+                    Err(err) => Err(err),
+                }
             }
             Err(err) => Err(err),
         }
+    }
+
+    /// Validate a directory this call found rather than created.
+    ///
+    /// Names the directory in the failure. A bare "does not have a protected private DACL"
+    /// describes a Windows ACL invariant most people have no reason to know, says nothing about
+    /// which path is at fault, and gives no way forward - while the fix is usually just removing a
+    /// folder something else left at the managed path.
+    fn validate_found_dir(dir: &Path, directory: &fs::File) -> io::Result<()> {
+        validate_private_dir_handle(directory).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "{}: {error}. This directory was not created by the managed installer; \
+                     remove it and run the install again.",
+                    dir.display()
+                ),
+            )
+        })
     }
 
     /// Write `bytes` into a private parent directory. Child files inherit the protected DACL.
@@ -466,5 +485,50 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&target);
+    }
+}
+
+/// Cross-platform because the guarantee is: whoever loses the create still gets a validated
+/// directory back. Unix has always held it - `create_dir_all` accepts an existing directory - and
+/// Windows now does too.
+#[cfg(test)]
+mod concurrent_tests {
+    use super::*;
+
+    /// Every thread that asks for a private directory gets one, however many ask at once.
+    ///
+    /// `ensure_private_dir` looks the directory up and then creates it, so on a path that does not
+    /// exist yet every thread takes the create branch. On Windows that create is a `FILE_CREATE`,
+    /// which reports `ERROR_ALREADY_EXISTS` rather than accepting the directory the winner just
+    /// made; the losers used to propagate that as a hard failure, so a caller's first use of a
+    /// managed directory could fail for no reason but timing.
+    ///
+    /// A race, so it is a stress test rather than a proof: threads that happen to serialise still
+    /// pass. It cannot fail spuriously, and with the create branch unguarded it failed on every
+    /// one of 20 Windows runs.
+    #[test]
+    fn losing_the_create_race_still_yields_a_validated_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "relswap-fs-security-test-race-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let dir = dir.clone();
+                std::thread::spawn(move || ensure_private_dir(&dir))
+            })
+            .collect();
+        for thread in threads {
+            thread
+                .join()
+                .expect("thread completes")
+                .expect("a lost create race is not a failure");
+        }
+        // The directory the racers agreed on is a real one, not a handle each of them invented.
+        ensure_private_dir(&dir).expect("the directory the race left behind is private");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
