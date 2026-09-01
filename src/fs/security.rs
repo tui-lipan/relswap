@@ -30,12 +30,14 @@ pub fn current_uid() -> u32 {
 /// Create (if missing) or validate an existing directory as private to the current user.
 #[cfg(unix)]
 pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::fs::PermissionsExt;
 
     match fs::symlink_metadata(dir) {
         Ok(metadata) => validate_private_dir(dir, &metadata),
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir_all(dir)?;
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true).mode(0o700).create(dir)?;
             fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
             validate_private_dir(dir, &fs::symlink_metadata(dir)?)
         }
