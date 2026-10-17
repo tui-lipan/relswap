@@ -23,6 +23,30 @@ enum SelfTestOutput {
     LimitExceeded,
 }
 
+/// Reserve `read` bytes of the shared self-test output budget, or return false when they would
+/// exceed it. A hand-written loop rather than `fetch_update`, which newer toolchains deprecate in
+/// favor of a `try_update` the supported 1.88 does not have.
+fn reserve_output(output_size: &AtomicUsize, read: usize) -> bool {
+    let mut current = output_size.load(Ordering::Relaxed);
+    loop {
+        let Some(total) = current
+            .checked_add(read)
+            .filter(|total| *total <= SELF_TEST_OUTPUT_LIMIT)
+        else {
+            return false;
+        };
+        match output_size.compare_exchange_weak(
+            current,
+            total,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 fn spawn_self_test_reader<R>(
     mut reader: R,
     stream: usize,
@@ -39,13 +63,7 @@ fn spawn_self_test_reader<R>(
                 if read == 0 {
                     return Ok(());
                 }
-                let reserved =
-                    output_size.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                        current
-                            .checked_add(read)
-                            .filter(|total| *total <= SELF_TEST_OUTPUT_LIMIT)
-                    });
-                if reserved.is_err() {
+                if !reserve_output(&output_size, read) {
                     let _ = sender.send(SelfTestOutput::LimitExceeded);
                     return Ok(());
                 }
