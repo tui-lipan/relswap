@@ -637,10 +637,13 @@ fn inspect_zip(path: &Path, root: &str, payload: &str, launcher: &str) -> Result
         let mut entry = archive
             .by_index(index)
             .map_err(|error| format!("read zip entry {index}: {error}"))?;
-        if entry.name().contains('\\') {
-            return Err(format!("unsafe archive member {:?}", entry.name()));
+        let member = entry
+            .name()
+            .map_err(|error| format!("read zip entry {index} name: {error}"))?
+            .into_owned();
+        if member.contains('\\') {
+            return Err(format!("unsafe archive member {member:?}"));
         }
-        let member = entry.name().to_string();
         validate_member(&member, root)?;
         if !paths.insert(member.clone()) {
             return Err(format!("archive contains duplicate member {member}"));

@@ -26,7 +26,7 @@ sha2 = "0.10"
 tar = { version = "0.4", default-features = false }
 ureq = { version = "3.3", default-features = false, features = ["rustls", "platform-verifier"] }
 url = "2"
-zip = { version = "5.1", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9.0", default-features = false, features = ["deflate-flate2"] }
 
 [features]
 default = []

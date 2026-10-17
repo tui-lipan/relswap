@@ -1648,7 +1648,9 @@ mod tests {
             let mut writer = ZipWriter::new(&mut commented);
             let options =
                 SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
-            writer.set_comment("comment containing PK\u{5}\u{6} marker");
+            writer
+                .set_comment("comment containing PK\u{5}\u{6} marker")
+                .unwrap();
             writer.add_directory(format!("{root}/"), options).unwrap();
             writer
                 .start_file(format!("{root}/hyprmux.exe"), options)
