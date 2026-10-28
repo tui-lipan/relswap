@@ -957,7 +957,7 @@ mod windows_handle {
     }
 
     pub(super) fn delete_open_file(file: &File) -> io::Result<()> {
-        let disposition = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
         let ok = unsafe {
             SetFileInformationByHandle(
                 file.as_raw_handle() as HANDLE,
@@ -1092,7 +1092,7 @@ mod windows_handle {
             RootDirectory: directory.as_raw_handle() as HANDLE,
             ObjectName: &raw const unicode,
             Attributes: object_flags,
-            SecurityDescriptor: security_descriptor,
+            SecurityDescriptor: security_descriptor.cast_const().cast(),
             SecurityQualityOfService: std::ptr::null_mut(),
         };
         let mut status_block: IO_STATUS_BLOCK = unsafe { zeroed() };
