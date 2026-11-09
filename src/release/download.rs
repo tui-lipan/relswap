@@ -54,12 +54,22 @@ impl DownloadResponse {
 /// [`UreqDownloader`] instead - which also means an [`Installation`] gains a meter by being handed
 /// a differently configured downloader, not by growing a parameter.
 ///
+/// The one exception is [`Downloader::archive_ready`], which is not transfer progress but a step of
+/// the release: the archive was received and verified. Only the operation that verifies it knows
+/// that, and it reaches the transport through this trait. It has a default, so a fake ignores it.
+///
 /// [`Installation`]: crate::Installation
 pub trait Downloader {
     fn fetch(&self, url: &Url, max_bytes: usize) -> Result<DownloadResponse>;
+
+    /// The release archive, `bytes` long, has been received in full and verified against the
+    /// signed manifest. Nothing more is downloaded for it; what follows is installing it.
+    fn archive_ready(&self, bytes: u64) {
+        let _ = bytes;
+    }
 }
 
-/// Notified as a response body arrives.
+/// Notified as a response body arrives, and once the release archive is ready.
 ///
 /// `total` is the `Content-Length` when the server sent one. A chunked response has none, so an
 /// observer must be able to represent an unknown total rather than assuming a fraction exists.
@@ -68,8 +78,20 @@ pub trait Downloader {
 /// transfer rather than appearing only once the first chunk lands on a slow link. Implementations
 /// are called from the thread driving the download and should return promptly; throttle redraws in
 /// the observer rather than slowing the transfer.
+///
+/// Every fetch is reported, the small metadata and signature as well as the archive, and the end
+/// of a body is not: with no total, nothing in [`Self::advance`] says a transfer is over. The
+/// boundary an observer can act on is [`Self::archive_ready`].
 pub trait ProgressObserver: Send + Sync {
     fn advance(&self, downloaded: u64, total: Option<u64>);
+
+    /// The release archive, `bytes` long, has been received in full and verified against the
+    /// signed manifest, whether or not its length was known while it arrived. Nothing more is
+    /// downloaded for it; what follows is installing it. Not called for metadata or signatures,
+    /// nor for an archive that fails verification.
+    fn archive_ready(&self, bytes: u64) {
+        let _ = bytes;
+    }
 }
 
 /// How much body to accumulate between observer calls.
@@ -232,6 +254,25 @@ mod progress_tests {
         assert!(progress_read_limit(usize::MAX).is_err());
     }
 
+    /// The production downloader hands the archive boundary to its observer, which is how a
+    /// consumer's meter learns the download is over even when no length was ever sent.
+    #[test]
+    fn a_progress_downloader_tells_its_observer_the_archive_is_ready() {
+        #[derive(Default)]
+        struct Ready(Mutex<Vec<u64>>);
+        impl ProgressObserver for Ready {
+            fn advance(&self, _: u64, _: Option<u64>) {}
+            fn archive_ready(&self, bytes: u64) {
+                self.0.lock().expect("ready lock").push(bytes);
+            }
+        }
+        let observer = Arc::new(Ready::default());
+        UreqDownloader::with_progress(observer.clone()).archive_ready(42);
+        assert_eq!(*observer.0.lock().expect("lock"), vec![42]);
+        // Without an observer there is nobody to tell, and nothing to fail.
+        UreqDownloader::new().archive_ready(42);
+    }
+
     #[test]
     fn a_downloader_without_an_observer_is_the_default() {
         assert!(UreqDownloader::new().observer.is_none());
@@ -275,6 +316,12 @@ impl Default for UreqDownloader {
 }
 
 impl Downloader for UreqDownloader {
+    fn archive_ready(&self, bytes: u64) {
+        if let Some(observer) = &self.observer {
+            observer.archive_ready(bytes);
+        }
+    }
+
     fn fetch(&self, url: &Url, max_bytes: usize) -> Result<DownloadResponse> {
         require_https(url)?;
         let mut response = self
@@ -473,6 +520,7 @@ pub fn download_archive<D: Downloader>(
     validate_response_transport(&response)?;
     reject_cross_release_redirects(app, &response, &metadata.version)?;
     verify_archive_bytes(app, &response.bytes, asset)?;
+    downloader.archive_ready(response.bytes.len() as u64);
     Ok(DownloadedArchive {
         target,
         name: asset.archive.clone(),
@@ -762,17 +810,23 @@ mod tests {
 
     struct MockDownloader {
         responses: Mutex<HashMap<String, DownloadResponse>>,
+        ready: Mutex<Vec<u64>>,
     }
 
     impl MockDownloader {
         fn new(responses: HashMap<String, DownloadResponse>) -> Self {
             Self {
                 responses: Mutex::new(responses),
+                ready: Mutex::new(Vec::new()),
             }
         }
     }
 
     impl Downloader for MockDownloader {
+        fn archive_ready(&self, bytes: u64) {
+            self.ready.lock().unwrap().push(bytes);
+        }
+
         fn fetch(&self, url: &Url, max_bytes: usize) -> Result<DownloadResponse> {
             let response = self
                 .responses
@@ -896,6 +950,10 @@ mod tests {
             fetch_latest_metadata_with_keys(&TEST_APP, &downloader, &repository, &[trusted])
                 .unwrap();
         assert_eq!(metadata.version, version);
+        assert!(
+            downloader.ready.lock().unwrap().is_empty(),
+            "metadata and its signature are not the archive"
+        );
         let downloaded = download_archive(
             &TEST_APP,
             &downloader,
@@ -903,6 +961,32 @@ mod tests {
             Target::X86_64UnknownLinuxGnu,
         );
         assert!(downloaded.is_ok());
+        assert_eq!(
+            *downloader.ready.lock().unwrap(),
+            vec![b"archive bytes".len() as u64],
+            "a verified archive is announced once, with its size"
+        );
+
+        // An archive that fails verification is never announced as ready.
+        downloader.responses.lock().unwrap().insert(
+            archive_url.clone(),
+            response(
+                &archive_url,
+                &archive_url,
+                &[&archive_url],
+                b"tampered bytes".to_vec(),
+            ),
+        );
+        assert!(
+            download_archive(
+                &TEST_APP,
+                &downloader,
+                &metadata,
+                Target::X86_64UnknownLinuxGnu
+            )
+            .is_err()
+        );
+        assert_eq!(downloader.ready.lock().unwrap().len(), 1);
     }
 
     #[test]
