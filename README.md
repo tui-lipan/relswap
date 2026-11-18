@@ -28,3 +28,16 @@ degrades into a late expiry rather than being unable to update at all.
 ## License
 
 MIT OR Apache-2.0
+
+
+### Windows companion files
+
+Set `App::windows_companions` to the exact basenames of files to install beside the
+Windows payload, in dependency order. Use an empty slice for applications without
+companions. The signed archive can supply the full set or omit it for an older
+release. Other archive members stay outside the managed install.
+
+relswap keeps the signed archive alongside the installed files so it can verify their
+contents on recovery and rollback without changing the release manifest format. An
+older updater can install the payload from a new archive. Reinstall that release with
+the new installer to add its companions.

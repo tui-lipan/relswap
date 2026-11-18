@@ -435,7 +435,7 @@ impl<D: Downloader> Installation<D> {
             let active = from.as_ref().expect("managed pointer is present");
             if version <= *active {
                 if version == *active {
-                    let state = self.verify_final_version(
+                    self.verify_final_version(
                         active,
                         install.as_ref().map(|s| s.installation_id.as_str()),
                     )?;
@@ -448,10 +448,11 @@ impl<D: Downloader> Installation<D> {
                         ));
                     }
                     self.ensure_command_owned(Some(active), install.as_ref())?;
-                    let _ = state;
+                    let changed =
+                        self.complete_legacy_version(active, &metadata, &archive, target)?;
                     return Ok(ActivationResult {
                         version: active.clone(),
-                        changed: false,
+                        changed,
                     });
                 }
                 return Err(InstallError::Downgrade {
@@ -485,6 +486,7 @@ impl<D: Downloader> Installation<D> {
                     "existing final version has different signed metadata".to_string(),
                 ));
             }
+            self.complete_legacy_version(&version, &metadata, &archive, target)?;
             if let Some(install) = &install {
                 self.verify_installed_launcher(install)?;
             } else {
@@ -837,12 +839,18 @@ impl<D: Downloader> Installation<D> {
         let selected = self.verify_metadata(metadata, target)?;
         let archive_path = transaction.dir.join(&selected.asset.archive);
         executable::create_new_file(&archive_path, &archive.bytes, Some(0o600))?;
-        release::extract_archive_file(
+        let extracted = release::extract_archive_file(
             self.app,
             &archive_path,
             selected.asset,
             &transaction.version_dir,
         )?;
+        if !extracted.companions.is_empty() {
+            executable::rename_new(
+                &archive_path,
+                &transaction.version_dir.join(COMPANION_ARCHIVE),
+            )?;
+        }
         executable::atomic_replace_file_with_mode(
             &transaction.version_dir.join(MANIFEST_FILE),
             &metadata.manifest_bytes,
@@ -1075,8 +1083,95 @@ impl<D: Downloader> Installation<D> {
                 "Unix version contains Windows launcher metadata".into(),
             ));
         }
-        validate_exact_version_members(self.app, dir, target)?;
+        let companions = self.verify_version_companions(dir, target, selected.asset)?;
+        validate_exact_version_members(self.app, dir, target, &companions)?;
         Ok(state)
+    }
+
+    /// Older installers only staged the executable. Reinstalling the same signed release
+    /// can complete that immutable directory without replacing an executable in use.
+    fn complete_legacy_version(
+        &self,
+        version: &Version,
+        metadata: &ReleaseMetadata,
+        archive: &release::DownloadedArchive,
+        target: ReleaseTarget,
+    ) -> Result<bool> {
+        let dir = self.version_dir(version);
+        let proof = dir.join(COMPANION_ARCHIVE);
+        if !target.is_windows() || self.app.windows_companions.is_empty() || lexists(&proof)? {
+            return Ok(false);
+        }
+        let selected = self.verify_metadata(metadata, target)?;
+        let extracted = release::inspect_archive(self.app, &archive.bytes, selected.asset)?;
+        if extracted.companions.is_empty() {
+            return Ok(false);
+        }
+        // Commit the authenticated source first. Recovery can finish a partial copy after a crash.
+        self.add_version_file(&proof, &archive.bytes)?;
+        self.verify_version_companions(&dir, target, selected.asset)?;
+        Ok(true)
+    }
+
+    fn verify_version_companions(
+        &self,
+        dir: &Path,
+        target: ReleaseTarget,
+        asset: &release::ReleaseAsset,
+    ) -> Result<Vec<release::VerifiedMember>> {
+        let proof = dir.join(COMPANION_ARCHIVE);
+        if !target.is_windows() || self.app.windows_companions.is_empty() || !lexists(&proof)? {
+            return Ok(Vec::new());
+        }
+        let bytes = read_regular_limited(&proof, release::MAX_ARCHIVE_SIZE as usize)?;
+        let mut companions = release::inspect_archive(self.app, &bytes, asset)?.companions;
+        if companions.is_empty() {
+            return Err(InstallError::Invalid(
+                "companion archive has no companions".into(),
+            ));
+        }
+        // Applications can declare runtime dependencies before their loaders. Keep that order
+        // when finishing an interrupted install or reinstall.
+        companions.sort_by_key(|member| {
+            self.app
+                .windows_companions
+                .iter()
+                .position(|name| *name == member.basename())
+        });
+        for member in &companions {
+            let path = dir.join(member.basename());
+            if !lexists(&path)? {
+                self.add_version_file(&path, &member.data)?;
+            }
+            verify_file_digest(
+                &path,
+                member.data.len() as u64,
+                &release::sha256_bytes(&member.data),
+                member.basename(),
+            )?;
+        }
+        Ok(companions)
+    }
+
+    fn add_version_file(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        let staging = self.staging_dir().join(random_id("companion")?);
+        fs_security::ensure_private_dir(&staging)?;
+        let file = staging.join("member");
+        let result = (|| {
+            executable::create_new_file(&file, bytes, Some(0o600))?;
+            if let Err(error) = executable::rename_new(&file, path)
+                && error.kind() != io::ErrorKind::AlreadyExists
+            {
+                return Err(error);
+            }
+            if let Some(parent) = path.parent() {
+                executable::sync_dir(parent)?;
+            }
+            Ok(())
+        })();
+        let cleanup = fs::remove_dir_all(staging);
+        result.and(cleanup)?;
+        Ok(())
     }
 
     fn sync_staging_transaction(&self, transaction: &Transaction) -> Result<()> {
@@ -1297,7 +1392,12 @@ impl<D: Downloader> Installation<D> {
 
 /// An immutable version directory contains exactly the signed payload, its signed metadata, and
 /// the local version state.
-fn validate_exact_version_members(app: &App, dir: &Path, target: ReleaseTarget) -> Result<()> {
+fn validate_exact_version_members(
+    app: &App,
+    dir: &Path,
+    target: ReleaseTarget,
+    companions: &[release::VerifiedMember],
+) -> Result<()> {
     let payload_unix = app.payload_name(false);
     let payload_windows = app.payload_name(true);
     let metadata_members = [MANIFEST_FILE, SIGNATURE_FILE, VERSION_FILE];
@@ -1308,7 +1408,11 @@ fn validate_exact_version_members(app: &App, dir: &Path, target: ReleaseTarget) 
             .and_then(|name| name.to_str())
             .ok_or_else(|| InstallError::Invalid("version member is not UTF-8".into()))?;
         let allowed = if target.is_windows() {
-            name == payload_windows || metadata_members.contains(&name)
+            name == payload_windows
+                || metadata_members.contains(&name)
+                || (!companions.is_empty()
+                    && (name == COMPANION_ARCHIVE
+                        || companions.iter().any(|member| member.basename() == name)))
         } else {
             name == payload_unix || metadata_members.contains(&name)
         };

@@ -804,6 +804,7 @@ mod tests {
         version: "1.2.3",
         repository_url: "https://example.test/hyprmux/",
         trust_anchor: br#"{"schema_version":1,"keys":[]}"#,
+        windows_companions: &[],
         activation: ActivationStrategy::UnixSymlink,
         self_test: None,
     };

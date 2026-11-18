@@ -15,6 +15,8 @@ pub struct App {
     pub repository_url: &'static str,
     /// Raw JSON bytes of a [`crate::release::TrustedKeySet`] (caller's `include_bytes!`).
     pub trust_anchor: &'static [u8],
+    /// Exact archive basenames of Windows files installed beside the payload.
+    pub windows_companions: &'static [&'static str],
     /// How the stable command path is activated on each OS.
     pub activation: ActivationStrategy,
     /// Optional pre-activation probe executed after verification and before the pointer switch.

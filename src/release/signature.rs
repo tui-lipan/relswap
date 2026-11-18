@@ -305,6 +305,7 @@ mod tests {
         version: "0.2.0",
         repository_url: "https://example.test/hyprmux/",
         trust_anchor: br#"{"schema_version":1,"keys":[]}"#,
+        windows_companions: &[],
         activation: ActivationStrategy::UnixSymlink,
         self_test: None,
     };

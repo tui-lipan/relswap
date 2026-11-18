@@ -34,6 +34,7 @@ const BIN_DIR: &str = "bin";
 const MANIFEST_FILE: &str = "release.json";
 const SIGNATURE_FILE: &str = "release.signatures.json";
 const VERSION_FILE: &str = "version.json";
+const COMPANION_ARCHIVE: &str = "companions.zip";
 #[cfg(windows)]
 const LAUNCHER_CREATED_MARKER: &str = ".launcher-created";
 
@@ -993,6 +994,7 @@ mod tests {
         version: "1.2.3",
         repository_url: "https://github.com/Razuer/hyprmux/",
         trust_anchor: br#"{"schema_version":1,"keys":[]}"#,
+        windows_companions: &[],
         activation: ActivationStrategy::WindowsLauncher {
             launcher_name: "hyprmux-launcher.exe",
             protocol: 1,
@@ -1145,6 +1147,7 @@ mod tests {
         version: &Version,
         payload: &[u8],
         launcher: &[u8],
+        companions: &[(&str, &[u8])],
     ) -> Vec<u8> {
         use std::io::Write;
         use zip::write::SimpleFileOptions;
@@ -1169,6 +1172,15 @@ mod tests {
                 .start_file(target.launcher_path(&TEST_APP, version).unwrap(), options)
                 .unwrap();
             writer.write_all(launcher).unwrap();
+            for (name, bytes) in companions {
+                writer
+                    .start_file(
+                        format!("{}/{name}", target.root_name(&TEST_APP, version)),
+                        options,
+                    )
+                    .unwrap();
+                writer.write_all(bytes).unwrap();
+            }
             writer.finish().unwrap();
         }
         output.into_inner()
@@ -1181,11 +1193,18 @@ mod tests {
     /// only the Unix shape would leave the Windows install path with no passing coverage at all.
     #[allow(dead_code)]
     fn signed_fixture(version: &Version) -> (ReleaseMetadata, TrustedKey, Vec<u8>) {
+        signed_fixture_with_companions(version, &[])
+    }
+
+    fn signed_fixture_with_companions(
+        version: &Version,
+        companions: &[(&str, &[u8])],
+    ) -> (ReleaseMetadata, TrustedKey, Vec<u8>) {
         let target = Target::current().unwrap();
         let payload = b"fixture payload";
         let launcher = b"fixture launcher";
         let archive = if target.is_windows() {
-            windows_fixture_archive(target, version, payload, launcher)
+            windows_fixture_archive(target, version, payload, launcher, companions)
         } else {
             unix_fixture_archive(target, version, payload)
         };
@@ -1367,7 +1386,9 @@ mod tests {
     #[test]
     fn signed_install_creates_the_pointer_and_immutable_state() {
         let version = Version::parse("1.2.3").unwrap();
-        let (metadata, trusted, archive) = signed_fixture(&version);
+        let companions: &[(&str, &[u8])] =
+            &[("OpenConsole.exe", b"host"), ("conpty.dll", b"driver")];
+        let (metadata, trusted, archive) = signed_fixture_with_companions(&version, companions);
         let exact = release::download::exact_metadata_url(
             &TEST_APP,
             &Url::parse(TEST_APP.repository_url).unwrap(),
@@ -1426,7 +1447,7 @@ mod tests {
         #[cfg(windows)]
         let command = root.join("bin/hyprmux-launcher.exe");
         let manager = Installation::new(&TEST_APP, &root, &command, downloader, NoFaultInjector)
-            .with_trusted_keys(vec![trusted]);
+            .with_trusted_keys(vec![trusted.clone()]);
         let result = manager.install_version(version.clone()).unwrap();
         assert_eq!(result.version, version);
         assert!(result.changed);
@@ -1449,6 +1470,28 @@ mod tests {
         {
             let active = fs::read_to_string(manager.active_path()).unwrap();
             assert_eq!(active.trim(), version.to_string());
+            let dir = manager.version_dir(&version);
+            assert!(!dir.join("conpty.dll").exists());
+            static WITH_COMPANIONS: App = App {
+                windows_companions: &["OpenConsole.exe", "conpty.dll"],
+                ..TEST_APP
+            };
+            let manager = Installation::new(
+                &WITH_COMPANIONS,
+                &root,
+                &command,
+                manager.downloader,
+                NoFaultInjector,
+            )
+            .with_trusted_keys(vec![trusted]);
+            assert!(manager.install_version(version.clone()).unwrap().changed);
+            assert_eq!(fs::read(dir.join("conpty.dll")).unwrap(), b"driver");
+            assert_eq!(fs::read(dir.join("OpenConsole.exe")).unwrap(), b"host");
+            assert!(!manager.install_version(version.clone()).unwrap().changed);
+
+            fs::write(dir.join("conpty.dll"), b"edited").unwrap();
+            let error = manager.recover_if_managed().unwrap_err();
+            assert!(error.to_string().contains("conpty.dll SHA-256 mismatch"));
         }
         let _ = fs::remove_dir_all(&root);
     }
@@ -1742,6 +1785,7 @@ mod tests {
             version: "1.2.3",
             repository_url: "https://example.test/",
             trust_anchor: br#"{"schema_version":1,"keys":[]}"#,
+            windows_companions: &[],
             activation: ActivationStrategy::UnixSymlink,
             self_test: SELF_TEST,
         };
@@ -1765,6 +1809,7 @@ mod tests {
             version: "1.2.3",
             repository_url: "https://example.test/",
             trust_anchor: br#"{"schema_version":1,"keys":[]}"#,
+            windows_companions: &[],
             activation: ActivationStrategy::UnixSymlink,
             self_test: SELF_TEST,
         };
@@ -1791,6 +1836,7 @@ mod tests {
             version: "1.2.3",
             repository_url: "https://example.test/",
             trust_anchor: br#"{"schema_version":1,"keys":[]}"#,
+            windows_companions: &[],
             activation: ActivationStrategy::UnixSymlink,
             self_test: SELF_TEST,
         };
@@ -1821,6 +1867,7 @@ mod tests {
             version: "1.2.3",
             repository_url: "https://example.test/",
             trust_anchor: br#"{"schema_version":1,"keys":[]}"#,
+            windows_companions: &[],
             activation: ActivationStrategy::UnixSymlink,
             self_test: Some(crate::SelfTest {
                 args: &[],
@@ -1853,6 +1900,7 @@ mod tests {
             version: "1.2.3",
             repository_url: "https://example.test/",
             trust_anchor: br#"{"schema_version":1,"keys":[]}"#,
+            windows_companions: &[],
             activation: ActivationStrategy::UnixSymlink,
             self_test: Some(crate::SelfTest {
                 args: &[],
@@ -1891,6 +1939,7 @@ mod tests {
             version: "1.2.3",
             repository_url: "https://example.test/",
             trust_anchor: br#"{"schema_version":1,"keys":[]}"#,
+            windows_companions: &[],
             activation: ActivationStrategy::UnixSymlink,
             self_test: SELF_TEST,
         };
@@ -1923,6 +1972,7 @@ mod tests {
             version: "1.2.3",
             repository_url: "https://example.test/",
             trust_anchor: br#"{"schema_version":1,"keys":[]}"#,
+            windows_companions: &[],
             activation: ActivationStrategy::UnixSymlink,
             self_test: SELF_TEST,
         };
