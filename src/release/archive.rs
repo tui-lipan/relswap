@@ -27,6 +27,17 @@ pub struct VerifiedMember {
 pub struct ExtractedRelease {
     pub payload: VerifiedMember,
     pub launcher: Option<VerifiedMember>,
+    pub companions: Vec<VerifiedMember>,
+}
+
+impl VerifiedMember {
+    /// The final component of the validated archive path.
+    pub fn basename(&self) -> &str {
+        self.path
+            .rsplit('/')
+            .next()
+            .expect("split always yields one component")
+    }
 }
 
 pub type VerifiedArchive = ExtractedRelease;
@@ -111,51 +122,52 @@ pub fn extract_archive(
     } else {
         None
     };
-    let payload_path = write_member(&destination_handle, &release.payload, &payload_name)?;
-    let launcher_path = match &release.launcher {
-        Some(launcher) => {
-            let name = launcher_name.expect("launcher name checked before payload creation");
-            match write_member(&destination_handle, launcher, name) {
-                Ok(path) => Some(path),
-                Err(error) => {
-                    if let Err(cleanup) = destination_handle.remove_file(&payload_name) {
-                        return Err(ReleaseError::archive(format!(
-                            "{error}; payload rollback failed: {cleanup}"
-                        )));
-                    }
-                    return Err(error);
-                }
-            }
-        }
-        None => None,
-    };
-    let destination_identity = destination_handle.path_still_identifies_directory();
-    if !matches!(destination_identity, Ok(true)) {
-        let mut cleanup_errors = Vec::new();
-        if let Some(name) = launcher_name
-            && let Err(error) = destination_handle.remove_file(name)
-        {
-            cleanup_errors.push(format!("launcher cleanup failed: {error}"));
-        }
-        if let Err(error) = destination_handle.remove_file(&payload_name) {
-            cleanup_errors.push(format!("payload cleanup failed: {error}"));
-        }
-        let reason = match destination_identity {
-            Ok(false) => "extraction destination pathname changed during extraction".to_string(),
-            Err(error) => format!("could not revalidate extraction destination: {error}"),
-            Ok(true) => unreachable!(),
+    let mut written = Vec::new();
+    let result = (|| {
+        let mut write = |member, name| {
+            let path = write_member(&destination_handle, member, name)?;
+            written.push(name);
+            Ok(path)
         };
-        if cleanup_errors.is_empty() {
-            return Err(ReleaseError::archive(reason));
+        let payload = write(&release.payload, payload_name.as_str())?;
+        let launcher = release
+            .launcher
+            .as_ref()
+            .zip(launcher_name)
+            .map(|(member, name)| write(member, name))
+            .transpose()?;
+        let companions = release
+            .companions
+            .iter()
+            .map(|member| write(member, member.basename()))
+            .collect::<Result<Vec<_>>>()?;
+        if !destination_handle.path_still_identifies_directory()? {
+            return Err(ReleaseError::archive(
+                "extraction destination pathname changed during extraction".to_string(),
+            ));
         }
-        return Err(ReleaseError::archive(format!(
-            "{reason}; {}",
-            cleanup_errors.join("; ")
-        )));
-    }
-    Ok(ExtractedPaths {
-        payload: payload_path,
-        launcher: launcher_path,
+        Ok(ExtractedPaths {
+            payload,
+            launcher,
+            companions,
+        })
+    })();
+    result.map_err(|error| {
+        let cleanup = written
+            .iter()
+            .rev()
+            .filter_map(|name| {
+                destination_handle
+                    .remove_file(name)
+                    .err()
+                    .map(|cleanup| format!("{name} rollback failed: {cleanup}"))
+            })
+            .collect::<Vec<_>>();
+        if cleanup.is_empty() {
+            error
+        } else {
+            ReleaseError::archive(format!("{error}; {}", cleanup.join("; ")))
+        }
     })
 }
 
@@ -183,6 +195,7 @@ pub fn extract_archive_file(
 pub struct ExtractedPaths {
     pub payload: PathBuf,
     pub launcher: Option<PathBuf>,
+    pub companions: Vec<PathBuf>,
 }
 
 pub type ExtractedFiles = ExtractedPaths;
@@ -431,6 +444,8 @@ fn inspect_zip(app: &App, bytes: &[u8], asset: &ReleaseAsset) -> Result<Extracte
     let mut total_uncompressed = 0u64;
     let mut payload = None;
     let mut launcher = None;
+    let mut companions = Vec::new();
+    validate_companion_names(app)?;
     let mut root_seen = false;
     let expected_launcher = target.launcher_path(app, &version);
 
@@ -483,7 +498,16 @@ fn inspect_zip(app: &App, bytes: &[u8], asset: &ReleaseAsset) -> Result<Extracte
                 "ZIP member {path} exceeds maximum size {MAX_MEMBER_SIZE}"
             )));
         }
+        let companion = path
+            .strip_prefix(&root)
+            .and_then(|tail| tail.strip_prefix('/'))
+            .filter(|name| app.windows_companions.contains(name));
         if entry.is_dir() {
+            if companion.is_some() {
+                return Err(ReleaseError::archive(format!(
+                    "companion is a directory: {path}"
+                )));
+            }
             if declared_size != 0 {
                 return Err(ReleaseError::archive(format!(
                     "directory member {path} has nonzero size"
@@ -519,7 +543,12 @@ fn inspect_zip(app: &App, bytes: &[u8], asset: &ReleaseAsset) -> Result<Extracte
         } else {
             None
         };
-        let data = read_member_data(&mut entry, declared_size, expected.is_some(), &path)?;
+        let data = read_member_data(
+            &mut entry,
+            declared_size,
+            expected.is_some() || companion.is_some(),
+            &path,
+        )?;
         if let Some((expected_size, expected_hash, is_payload)) = expected {
             verify_bytes(&data, *expected_size, expected_hash, &path)?;
             let member = VerifiedMember { path, data };
@@ -528,6 +557,11 @@ fn inspect_zip(app: &App, bytes: &[u8], asset: &ReleaseAsset) -> Result<Extracte
             } else {
                 launcher = Some(member);
             }
+        } else if companion.is_some() {
+            if data.is_empty() {
+                return Err(ReleaseError::archive(format!("empty companion: {path}")));
+            }
+            companions.push(VerifiedMember { path, data });
         }
     }
     if !root_seen {
@@ -535,7 +569,41 @@ fn inspect_zip(app: &App, bytes: &[u8], asset: &ReleaseAsset) -> Result<Extracte
             "archive has no canonical root directory {root}"
         )));
     }
-    finish_members(app, payload, launcher, asset)
+    if !companions.is_empty() && companions.len() != app.windows_companions.len() {
+        return Err(ReleaseError::archive(
+            "archive has an incomplete companion set".to_string(),
+        ));
+    }
+    let mut release = finish_members(app, payload, launcher, asset)?;
+    release.companions = companions;
+    Ok(release)
+}
+
+fn validate_companion_names(app: &App) -> Result<()> {
+    let payload = app.payload_name(true);
+    let mut names = HashSet::new();
+    for name in app.windows_companions {
+        let reserved = [
+            payload.as_str(),
+            app.launcher_name().unwrap_or_default(),
+            "release.json",
+            "release.signatures.json",
+            "version.json",
+            "companions.zip",
+        ];
+        if !name.is_ascii()
+            || !executable::is_safe_basename(name, true)
+            || reserved
+                .iter()
+                .any(|reserved| name.eq_ignore_ascii_case(reserved))
+            || !names.insert(name.to_ascii_lowercase())
+        {
+            return Err(ReleaseError::archive(format!(
+                "invalid companion name: {name:?}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn read_member_data<R: Read>(
@@ -599,7 +667,11 @@ fn finish_members(
             "non-Windows archive contained an unexpected launcher".to_string(),
         ));
     }
-    Ok(ExtractedRelease { payload, launcher })
+    Ok(ExtractedRelease {
+        payload,
+        launcher,
+        companions: Vec::new(),
+    })
 }
 
 fn validate_member_name(raw: &[u8], root: &str, index: usize) -> Result<String> {
@@ -1044,6 +1116,7 @@ mod tests {
         version: "0.2.0",
         repository_url: "https://example.test/hyprmux/",
         trust_anchor: br#"{"schema_version":1,"keys":[]}"#,
+        windows_companions: &[],
         activation: ActivationStrategy::WindowsLauncher {
             launcher_name: "hyprmux-launcher.exe",
             protocol: 1,

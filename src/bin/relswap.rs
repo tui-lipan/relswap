@@ -164,6 +164,7 @@ fn app_from_args(args: &Arguments) -> Result<App> {
         version: "0.0.0",
         repository_url: "https://example.invalid/",
         trust_anchor: EMPTY_TRUST_ANCHOR,
+        windows_companions: &[],
         activation: ActivationStrategy::WindowsLauncher {
             launcher_name,
             protocol: 1,
@@ -1031,6 +1032,7 @@ mod tests {
             version: "0.0.0",
             repository_url: "https://example.invalid/",
             trust_anchor: EMPTY_TRUST_ANCHOR,
+            windows_companions: &[],
             activation: ActivationStrategy::WindowsLauncher {
                 launcher_name: "demo-launcher.exe",
                 protocol: 1,
@@ -1055,6 +1057,7 @@ mod tests {
             version: "0.0.0",
             repository_url: "https://example.invalid/",
             trust_anchor: EMPTY_TRUST_ANCHOR,
+            windows_companions: &[],
             activation: ActivationStrategy::WindowsLauncher {
                 launcher_name: "demo-launcher.exe",
                 protocol: 1,
